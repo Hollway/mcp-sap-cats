@@ -91,9 +91,10 @@ CLASS zcl_cats_mcp_handler DEFINITION
       tt_record_in TYPE STANDARD TABLE OF ts_record_in WITH EMPTY KEY,
 
       BEGIN OF ts_validate_request,
-        pernr   TYPE catsdb-pernr,
-        profile TYPE bapicats6-profile,
-        records TYPE tt_record_in,
+        pernr      TYPE catsdb-pernr,
+        profile    TYPE bapicats6-profile,
+        records    TYPE tt_record_in,
+        norm_hours TYPE catsdb-catshours,
       END OF ts_validate_request,
 
       BEGIN OF ts_validate_response,
@@ -106,6 +107,7 @@ CLASS zcl_cats_mcp_handler DEFINITION
         records         TYPE tt_record_in,
         idempotency_key TYPE catsdb-extdocumentno,
         release         TYPE abap_bool,
+        norm_hours      TYPE catsdb-catshours,
       END OF ts_insert_request,
 
       BEGIN OF ts_created_row,
@@ -254,7 +256,9 @@ CLASS zcl_cats_mcp_handler DEFINITION
         norm_hours TYPE catsdb-catshours,
         calendar   TYPE scal-fcalid,
         total_free TYPE catsdb-catshours,
-      END OF ts_capacity_response.
+      END OF ts_capacity_response,
+
+      tt_workdate_range TYPE RANGE OF catsdb-workdate.
 
     CONSTANTS:
       c_extsystem      TYPE catsdb-extsystem      VALUE 'MCP',
@@ -324,6 +328,12 @@ CLASS zcl_cats_mcp_handler DEFINITION
     METHODS has_errors
       IMPORTING it_return        TYPE tt_bapiret2
       RETURNING VALUE(rv_result) TYPE abap_bool.
+
+    METHODS check_daily_limit
+      IMPORTING iv_pernr         TYPE catsdb-pernr
+                it_records       TYPE tt_record_in
+                iv_norm_hours    TYPE catsdb-catshours
+      RETURNING VALUE(rt_return) TYPE tt_bapiret2.
 ENDCLASS.
 
 
@@ -413,7 +423,7 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
   METHOD route_validate.
     DATA(lv_body) = read_body( server ).
 
-    DATA(ls_request) = VALUE ts_validate_request( ).
+    DATA(ls_request) = VALUE ts_validate_request( norm_hours = '8' ).
     /ui2/cl_json=>deserialize(
       EXPORTING
         json        = lv_body
@@ -449,6 +459,10 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
              TO lt_extensionin.
     ENDLOOP.
 
+    DATA(lt_limit_return) = check_daily_limit( iv_pernr      = ls_request-pernr
+                                                it_records    = ls_request-records
+                                                iv_norm_hours = ls_request-norm_hours ).
+
     CALL FUNCTION 'BAPI_CATIMESHEETMGR_INSERT'
       EXPORTING
         profile        = ls_request-profile
@@ -457,6 +471,8 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
         catsrecords_in = lt_catsrecords_in
         extensionin    = lt_extensionin
         return         = lt_return.
+
+    APPEND LINES OF lt_limit_return TO lt_return.
 
     DATA(ls_response) = VALUE ts_validate_response( messages = to_messages( lt_return ) ).
 
@@ -468,7 +484,7 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
   METHOD route_insert.
     DATA(lv_body) = read_body( server ).
 
-    DATA(ls_request) = VALUE ts_insert_request( ).
+    DATA(ls_request) = VALUE ts_insert_request( norm_hours = '8' ).
     /ui2/cl_json=>deserialize(
       EXPORTING
         json        = lv_body
@@ -534,6 +550,10 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
              TO lt_extensionin.
     ENDLOOP.
 
+    DATA(lt_limit_return) = check_daily_limit( iv_pernr      = ls_request-pernr
+                                                it_records    = ls_request-records
+                                                iv_norm_hours = ls_request-norm_hours ).
+
     CALL FUNCTION 'BAPI_CATIMESHEETMGR_INSERT'
       EXPORTING
         profile         = ls_request-profile
@@ -544,6 +564,8 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
         extensionin     = lt_extensionin
         catsrecords_out = lt_catsrecords_out
         return          = lt_return.
+
+    APPEND LINES OF lt_limit_return TO lt_return.
 
     DATA(lv_committed) = abap_false.
     DATA(lt_created)   = VALUE tt_created_row( ).
@@ -944,6 +966,45 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
 
   METHOD has_errors.
     rv_result = xsdbool( line_exists( it_return[ type = 'E' ] ) OR line_exists( it_return[ type = 'A' ] ) ).
+  ENDMETHOD.
+
+  METHOD check_daily_limit.
+    CHECK it_records IS NOT INITIAL.
+
+    DATA(lt_new_by_day) = VALUE tt_booked_day( ).
+    LOOP AT it_records INTO DATA(ls_record).
+      READ TABLE lt_new_by_day WITH KEY workdate = ls_record-workdate ASSIGNING FIELD-SYMBOL(<ls_new_day>).
+      IF sy-subrc = 0.
+        <ls_new_day>-hours = <ls_new_day>-hours + ls_record-hours.
+      ELSE.
+        APPEND VALUE ts_booked_day( workdate = ls_record-workdate hours = ls_record-hours ) TO lt_new_by_day.
+      ENDIF.
+    ENDLOOP.
+
+    DATA(lt_date_range) = VALUE tt_workdate_range( FOR ls_range_day IN lt_new_by_day
+                                                    ( sign = 'I' option = 'EQ' low = ls_range_day-workdate ) ).
+
+    DATA(lt_existing) = VALUE tt_booked_day( ).
+    SELECT workdate, SUM( catshours ) AS hours
+      FROM catsdb
+      WHERE pernr = @iv_pernr
+        AND workdate IN @lt_date_range
+      GROUP BY workdate
+      INTO TABLE @lt_existing.
+
+    LOOP AT lt_new_by_day INTO DATA(ls_new_day).
+      DATA(lv_existing) = VALUE catsdb-catshours( lt_existing[ workdate = ls_new_day-workdate ]-hours OPTIONAL ).
+      DATA(lv_total)    = lv_existing + ls_new_day-hours.
+
+      IF lv_total > iv_norm_hours.
+        APPEND VALUE bapiret2( type    = 'E'
+                                id      = 'MCP'
+                                number  = '002'
+                                message = |Превышена дневная норма { iv_norm_hours DECIMALS = 2 } ч на { ls_new_day-workdate DATE = ISO }: | &&
+                                          |уже { lv_existing DECIMALS = 2 } + новые { ls_new_day-hours DECIMALS = 2 } = { lv_total DECIMALS = 2 }| )
+               TO rt_return.
+      ENDIF.
+    ENDLOOP.
   ENDMETHOD.
 
 ENDCLASS.
