@@ -227,9 +227,39 @@ CLASS zcl_cats_mcp_handler DEFINITION
       tt_catsdb_full TYPE STANDARD TABLE OF ts_catsdb_full WITH EMPTY KEY,
       tt_counter_range TYPE RANGE OF catsdb-counter.
 
+    TYPES:
+      BEGIN OF ts_capacity_request,
+        pernr      TYPE catsdb-pernr,
+        date_from  TYPE catsdb-workdate,
+        date_to    TYPE catsdb-workdate,
+        norm_hours TYPE catsdb-catshours,
+      END OF ts_capacity_request,
+
+      BEGIN OF ts_booked_day,
+        workdate TYPE catsdb-workdate,
+        hours    TYPE catsdb-catshours,
+      END OF ts_booked_day,
+      tt_booked_day TYPE STANDARD TABLE OF ts_booked_day WITH EMPTY KEY,
+
+      BEGIN OF ts_capacity_day,
+        date       TYPE catsdb-workdate,
+        is_workday TYPE abap_bool,
+        booked     TYPE catsdb-catshours,
+        free       TYPE catsdb-catshours,
+      END OF ts_capacity_day,
+      tt_capacity_day TYPE STANDARD TABLE OF ts_capacity_day WITH EMPTY KEY,
+
+      BEGIN OF ts_capacity_response,
+        days       TYPE tt_capacity_day,
+        norm_hours TYPE catsdb-catshours,
+        calendar   TYPE scal-fcalid,
+        total_free TYPE catsdb-catshours,
+      END OF ts_capacity_response.
+
     CONSTANTS:
       c_extsystem      TYPE catsdb-extsystem      VALUE 'MCP',
-      c_extapplication TYPE catsdb-extapplication VALUE 'CATS'.
+      c_extapplication TYPE catsdb-extapplication VALUE 'CATS',
+      c_calendar       TYPE scal-fcalid           VALUE 'BY'.
 
     METHODS route_read
       IMPORTING server TYPE REF TO if_http_server.
@@ -247,6 +277,9 @@ CLASS zcl_cats_mcp_handler DEFINITION
       IMPORTING server TYPE REF TO if_http_server.
 
     METHODS route_release
+      IMPORTING server TYPE REF TO if_http_server.
+
+    METHODS route_capacity
       IMPORTING server TYPE REF TO if_http_server.
 
     METHODS route_stub
@@ -314,7 +347,7 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
           WHEN '/release'.
             route_release( server ).
           WHEN '/capacity'.
-            route_stub( server = server route = lv_path ).
+            route_capacity( server ).
           WHEN OTHERS.
             send_error( server = server code = 404 message = |Неизвестный маршрут: { lv_path }| ).
         ENDCASE.
@@ -773,6 +806,69 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
     DATA(ls_response) = VALUE ts_release_response( released  = lt_released
                                                      committed = lv_committed
                                                      messages  = to_messages( lt_return ) ).
+
+    DATA(lv_json) = /ui2/cl_json=>serialize( data        = ls_response
+                                              pretty_name = /ui2/cl_json=>pretty_mode-low_case ).
+    send_json( server = server code = 200 json = lv_json ).
+  ENDMETHOD.
+
+  METHOD route_capacity.
+    DATA(lv_body) = read_body( server ).
+
+    DATA(ls_request) = VALUE ts_capacity_request( norm_hours = '8' ).
+    /ui2/cl_json=>deserialize(
+      EXPORTING
+        json        = lv_body
+        pretty_name = /ui2/cl_json=>pretty_mode-low_case
+      CHANGING
+        data        = ls_request ).
+
+    DATA(lt_booked) = VALUE tt_booked_day( ).
+    SELECT workdate, SUM( catshours ) AS hours
+      FROM catsdb
+      WHERE pernr = @ls_request-pernr
+        AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
+      GROUP BY workdate
+      INTO TABLE @lt_booked.
+
+    DATA(lt_days)       = VALUE tt_capacity_day( ).
+    DATA(lv_total_free) = VALUE catsdb-catshours( ).
+    DATA(lv_date)       = ls_request-date_from.
+
+    WHILE lv_date <= ls_request-date_to.
+      DATA(lv_flag) = VALUE scal-indicator( ).
+      CALL FUNCTION 'DATE_CONVERT_TO_FACTORYDATE'
+        EXPORTING
+          date                 = lv_date
+          factory_calendar_id  = c_calendar
+        IMPORTING
+          workingday_indicator = lv_flag
+        EXCEPTIONS
+          date_invalid               = 1
+          date_before_range          = 2
+          date_after_range           = 3
+          factory_calendar_not_found = 4
+          OTHERS                     = 5.
+
+      DATA(lv_is_workday) = xsdbool( sy-subrc = 0 AND lv_flag = space ).
+      DATA(lv_booked)     = VALUE catsdb-catshours( lt_booked[ workdate = lv_date ]-hours OPTIONAL ).
+      DATA(lv_norm)       = COND catsdb-catshours( WHEN lv_is_workday = abap_true THEN ls_request-norm_hours ELSE 0 ).
+      DATA(lv_free)       = lv_norm - lv_booked.
+
+      APPEND VALUE ts_capacity_day( date       = lv_date
+                                     is_workday = lv_is_workday
+                                     booked     = lv_booked
+                                     free       = lv_free )
+             TO lt_days.
+
+      lv_total_free = lv_total_free + lv_free.
+      lv_date       = lv_date + 1.
+    ENDWHILE.
+
+    DATA(ls_response) = VALUE ts_capacity_response( days       = lt_days
+                                                      norm_hours = ls_request-norm_hours
+                                                      calendar   = c_calendar
+                                                      total_free = lv_total_free ).
 
     DATA(lv_json) = /ui2/cl_json=>serialize( data        = ls_response
                                               pretty_name = /ui2/cl_json=>pretty_mode-low_case ).
