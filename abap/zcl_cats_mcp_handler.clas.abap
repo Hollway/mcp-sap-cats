@@ -39,6 +39,7 @@ CLASS zcl_cats_mcp_handler DEFINITION
         pernr     TYPE catsdb-pernr,
         date_from TYPE catsdb-workdate,
         date_to   TYPE catsdb-workdate,
+        status    TYPE STANDARD TABLE OF catsdb-status WITH EMPTY KEY,
       END OF ts_read_request,
 
       BEGIN OF ts_read_response,
@@ -227,7 +228,8 @@ CLASS zcl_cats_mcp_handler DEFINITION
         orgunit    TYPE catsdb-zzorgunit,
       END OF ts_catsdb_full,
       tt_catsdb_full TYPE STANDARD TABLE OF ts_catsdb_full WITH EMPTY KEY,
-      tt_counter_range TYPE RANGE OF catsdb-counter.
+      tt_counter_range TYPE RANGE OF catsdb-counter,
+      tt_status_range TYPE RANGE OF catsdb-status.
 
     TYPES:
       BEGIN OF ts_capacity_request,
@@ -397,15 +399,31 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
         data        = ls_request ).
 
     DATA(lt_rows) = VALUE tt_cats_row( ).
-    SELECT counter, workdate, pernr,
-           rkostl AS rec_cctr, raufnr AS rec_order,
-           lstar AS acttype, lgart AS wagetype, meinh AS unit,
-           catshours AS hours, status,
-           zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit
-      FROM catsdb
-      WHERE pernr = @ls_request-pernr
-        AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
-      INTO TABLE @lt_rows.
+    DATA(lt_status_range) = VALUE tt_status_range( FOR lv_s IN ls_request-status
+                                                    ( sign = 'I' option = 'EQ' low = lv_s ) ).
+
+    IF ls_request-status IS NOT INITIAL.
+      SELECT counter, workdate, pernr,
+             rkostl AS rec_cctr, raufnr AS rec_order,
+             lstar AS acttype, lgart AS wagetype, meinh AS unit,
+             catshours AS hours, status,
+             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit
+        FROM catsdb
+        WHERE pernr = @ls_request-pernr
+          AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
+          AND status IN @lt_status_range
+        INTO TABLE @lt_rows.
+    ELSE.
+      SELECT counter, workdate, pernr,
+             rkostl AS rec_cctr, raufnr AS rec_order,
+             lstar AS acttype, lgart AS wagetype, meinh AS unit,
+             catshours AS hours, status,
+             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit
+        FROM catsdb
+        WHERE pernr = @ls_request-pernr
+          AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
+        INTO TABLE @lt_rows.
+    ENDIF.
 
     DATA(lv_total) = REDUCE catshours( INIT sum TYPE catshours
                                         FOR row IN lt_rows
