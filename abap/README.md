@@ -6,7 +6,7 @@
 
 - `ZCL_CATS_MCP_HANDLER` — создан, активен. Пакет `ZCATS`. Копия — [zcl_cats_mcp_handler.clas.abap](zcl_cats_mcp_handler.clas.abap), синхронизирована с системой.
   - Все маршруты — `/read`, `/validate`, `/insert`, `/change`, `/delete`, `/release`, `/capacity`, `/whoami`, `/projects` — реализованы и проверены вживую через сам MCP-сервер, включая реальные коммиты и подробный текст.
-- ABAP Unit — тестовый инклуд класса, копия — [zcl_cats_mcp_handler.clas.testclasses.abap](zcl_cats_mcp_handler.clas.testclasses.abap). 12 тестов, все проходят (ADT: Run As → ABAP Unit Test, `Ctrl+Shift+F10`). Маршруты целиком (связка с BAPI) тестами не покрыты.
+- ABAP Unit — тестовый инклуд класса, копия — [zcl_cats_mcp_handler.clas.testclasses.abap](zcl_cats_mcp_handler.clas.testclasses.abap). 17 тестов, все проходят (ADT: Run As → ABAP Unit Test, `Ctrl+Shift+F10`). Сам вызов BAPI тестами не покрыт, сборка данных для него (`build_insert_tables`, `build_change_tables`) — покрыта.
 - Узел SICF `/sap/bc/zcats` — создан и активен, обработчик назначен, **без сохранённых данных логона**.
 
 SAP после создания тестового инклуда сам пересортировал методы класса по алфавиту — перед построчной правкой сверять номера строк с активной версией в системе, а не с этой копией.

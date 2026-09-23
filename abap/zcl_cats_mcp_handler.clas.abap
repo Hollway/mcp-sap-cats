@@ -9,21 +9,22 @@ public section.
   PRIVATE SECTION.
     TYPES:
       BEGIN OF ts_cats_row,
-        counter   TYPE catsdb-counter,
-        workdate  TYPE catsdb-workdate,
-        pernr     TYPE catsdb-pernr,
-        rec_cctr  TYPE catsdb-rkostl,
-        rec_order TYPE catsdb-raufnr,
-        acttype   TYPE catsdb-lstar,
-        wagetype  TYPE catsdb-lgart,
-        unit      TYPE catsdb-meinh,
-        hours     TYPE catsdb-catshours,
-        status    TYPE catsdb-status,
-        rqsnb     TYPE catsdb-zzrqsnb,
-        prjct     TYPE catsdb-zzprjct,
-        descr     TYPE catsdb-zzdescr,
-        orgunit   TYPE catsdb-zzorgunit,
-        longtext  TYPE catsdb-longtext,
+        counter       TYPE catsdb-counter,
+        workdate      TYPE catsdb-workdate,
+        pernr         TYPE catsdb-pernr,
+        rec_cctr      TYPE catsdb-rkostl,
+        rec_order     TYPE catsdb-raufnr,
+        acttype       TYPE catsdb-lstar,
+        wagetype      TYPE catsdb-lgart,
+        unit          TYPE catsdb-meinh,
+        hours         TYPE catsdb-catshours,
+        status        TYPE catsdb-status,
+        rqsnb         TYPE catsdb-zzrqsnb,
+        prjct         TYPE catsdb-zzprjct,
+        descr         TYPE catsdb-zzdescr,
+        orgunit       TYPE catsdb-zzorgunit,
+        longtext      TYPE catsdb-longtext,
+        longtext_text TYPE string,
       END OF ts_cats_row,
       tt_cats_row TYPE STANDARD TABLE OF ts_cats_row WITH EMPTY KEY,
 
@@ -239,6 +240,19 @@ public section.
       tt_status_range TYPE RANGE OF catsdb-status.
 
     TYPES:
+      BEGIN OF ts_insert_tables,
+        catsrecords TYPE tt_bapicats1,
+        extensionin TYPE tt_bapicats7,
+        longtext    TYPE tt_bapicats8,
+      END OF ts_insert_tables,
+
+      BEGIN OF ts_change_tables,
+        catsrecords TYPE tt_bapicats3,
+        extensionin TYPE tt_bapicats7,
+        longtext    TYPE tt_bapicats8,
+      END OF ts_change_tables.
+
+    TYPES:
       BEGIN OF ts_capacity_request,
         pernr      TYPE catsdb-pernr,
         date_from  TYPE catsdb-workdate,
@@ -411,11 +425,95 @@ public section.
       IMPORTING iv_row          TYPE i
                 iv_counter      TYPE catsdb-counter
       RETURNING VALUE(rt_lines) TYPE tt_bapicats8.
+
+    METHODS longtext_to_string
+      IMPORTING it_lines       TYPE tt_bapicats8
+      RETURNING VALUE(rv_text) TYPE string.
+
+    METHODS build_insert_tables
+      IMPORTING iv_pernr           TYPE catsdb-pernr
+                it_records         TYPE tt_record_in
+                iv_idempotency_key TYPE catsdb-extdocumentno OPTIONAL
+      RETURNING VALUE(rs_tables)   TYPE ts_insert_tables.
+
+    METHODS build_change_tables
+      IMPORTING iv_pernr         TYPE catsdb-pernr
+                it_records       TYPE tt_change_record_in
+      RETURNING VALUE(rs_tables) TYPE ts_change_tables.
 ENDCLASS.
 
 
 
 CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
+
+
+  METHOD build_change_tables.
+    LOOP AT it_records INTO DATA(ls_record).
+      DATA(ls_bapicats3) = VALUE bapicats3( counter        = ls_record-counter
+                                             workdate       = ls_record-workdate
+                                             employeenumber = iv_pernr
+                                             catshours      = ls_record-hours
+                                             unit           = ls_record-unit
+                                             wagetype       = ls_record-wagetype
+                                             acttype        = ls_record-acttype
+                                             send_cctr      = ls_record-send_cctr
+                                             shorttext      = ls_record-shorttext
+                                             abs_att_type   = ls_record-attendance_type
+                                             starttime      = time_from_hhmm( ls_record-start_time )
+                                             endtime        = time_from_hhmm( ls_record-end_time )
+                                             longtext       = xsdbool( ls_record-longtext IS NOT INITIAL ) ).
+
+      map_receiver_bapicats3( EXPORTING is_receiver  = ls_record-receiver
+                               CHANGING  cs_bapicats3 = ls_bapicats3 ).
+
+      APPEND ls_bapicats3 TO rs_tables-catsrecords.
+      DATA(lv_row) = lines( rs_tables-catsrecords ).
+      APPEND LINES OF split_longtext( iv_row  = lv_row
+                                      iv_text = ls_record-longtext ) TO rs_tables-longtext.
+
+      APPEND VALUE bapicats7( structure  = 'BAPI_TE_CATSDB'
+                               valuepart1 = to_bapi_te_catsdb( iv_row = lv_row
+                                                                is_ext = ls_record-ext ) )
+             TO rs_tables-extensionin.
+    ENDLOOP.
+  ENDMETHOD.
+
+
+  METHOD build_insert_tables.
+    LOOP AT it_records INTO DATA(ls_record).
+      DATA(ls_bapicats1) = VALUE bapicats1( workdate       = ls_record-workdate
+                                             employeenumber = iv_pernr
+                                             catshours      = ls_record-hours
+                                             unit           = ls_record-unit
+                                             wagetype       = ls_record-wagetype
+                                             acttype        = ls_record-acttype
+                                             send_cctr      = ls_record-send_cctr
+                                             shorttext      = ls_record-shorttext
+                                             abs_att_type   = ls_record-attendance_type
+                                             starttime      = time_from_hhmm( ls_record-start_time )
+                                             endtime        = time_from_hhmm( ls_record-end_time )
+                                             longtext       = xsdbool( ls_record-longtext IS NOT INITIAL ) ).
+
+      IF iv_idempotency_key IS NOT INITIAL.
+        ls_bapicats1-extsystem      = c_extsystem.
+        ls_bapicats1-extapplication = c_extapplication.
+        ls_bapicats1-extdocumentno  = iv_idempotency_key.
+      ENDIF.
+
+      map_receiver( EXPORTING is_receiver  = ls_record-receiver
+                    CHANGING  cs_bapicats1 = ls_bapicats1 ).
+
+      APPEND ls_bapicats1 TO rs_tables-catsrecords.
+      DATA(lv_row) = lines( rs_tables-catsrecords ).
+      APPEND LINES OF split_longtext( iv_row  = lv_row
+                                      iv_text = ls_record-longtext ) TO rs_tables-longtext.
+
+      APPEND VALUE bapicats7( structure  = 'BAPI_TE_CATSDB'
+                               valuepart1 = to_bapi_te_catsdb( iv_row = lv_row
+                                                                is_ext = ls_record-ext ) )
+             TO rs_tables-extensionin.
+    ENDLOOP.
+  ENDMETHOD.
 
 
   METHOD check_daily_limit.
@@ -496,6 +594,30 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       CATCH cx_root INTO DATA(lx_error).
         send_error( server = server code = 500 message = lx_error->get_text( ) ).
     ENDTRY.
+  ENDMETHOD.
+
+
+  METHOD longtext_to_string.
+    DATA(lt_paragraphs) = VALUE string_table( ).
+
+    LOOP AT it_lines INTO DATA(ls_line).
+      CASE ls_line-format_col.
+        WHEN '/:' OR '/*'.
+          CONTINUE.
+        WHEN '=' OR space.
+          IF lt_paragraphs IS INITIAL.
+            APPEND `` TO lt_paragraphs.
+          ENDIF.
+          ASSIGN lt_paragraphs[ lines( lt_paragraphs ) ] TO FIELD-SYMBOL(<lv_paragraph>).
+          <lv_paragraph> = COND #( WHEN ls_line-format_col = '=' OR <lv_paragraph> IS INITIAL
+                                   THEN <lv_paragraph> && ls_line-text_line
+                                   ELSE |{ <lv_paragraph> } { ls_line-text_line }| ).
+        WHEN OTHERS.
+          APPEND CONV string( ls_line-text_line ) TO lt_paragraphs.
+      ENDCASE.
+    ENDLOOP.
+
+    rv_text = concat_lines_of( table = lt_paragraphs sep = cl_abap_char_utilities=>newline ).
   ENDMETHOD.
 
 
@@ -652,40 +774,10 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       CHANGING
         data        = ls_request ).
 
-    DATA(lt_catsrecords_in)  = VALUE tt_bapicats3( ).
-    DATA(lt_extensionin)     = VALUE tt_bapicats7( ).
-    DATA(lt_longtext)        = VALUE tt_bapicats8( ).
+    DATA(ls_tables)          = build_change_tables( iv_pernr   = ls_request-pernr
+                                                    it_records = ls_request-records ).
     DATA(lt_catsrecords_out) = VALUE tt_bapicats2( ).
     DATA(lt_return)          = VALUE tt_bapiret2( ).
-
-    LOOP AT ls_request-records INTO DATA(ls_record).
-      DATA(ls_bapicats3) = VALUE bapicats3( counter        = ls_record-counter
-                                             workdate       = ls_record-workdate
-                                             employeenumber = ls_request-pernr
-                                             catshours      = ls_record-hours
-                                             unit           = ls_record-unit
-                                             wagetype       = ls_record-wagetype
-                                             acttype        = ls_record-acttype
-                                             send_cctr      = ls_record-send_cctr
-                                             shorttext      = ls_record-shorttext
-                                             abs_att_type   = ls_record-attendance_type
-                                             starttime      = time_from_hhmm( ls_record-start_time )
-                                             endtime        = time_from_hhmm( ls_record-end_time )
-                                             longtext       = xsdbool( ls_record-longtext IS NOT INITIAL ) ).
-
-      map_receiver_bapicats3( EXPORTING is_receiver  = ls_record-receiver
-                               CHANGING  cs_bapicats3 = ls_bapicats3 ).
-
-      APPEND ls_bapicats3 TO lt_catsrecords_in.
-      DATA(lv_row) = lines( lt_catsrecords_in ).
-      APPEND LINES OF split_longtext( iv_row  = lv_row
-                                      iv_text = ls_record-longtext ) TO lt_longtext.
-
-      APPEND VALUE bapicats7( structure  = 'BAPI_TE_CATSDB'
-                               valuepart1 = to_bapi_te_catsdb( iv_row = lv_row
-                                                                is_ext = ls_record-ext ) )
-             TO lt_extensionin.
-    ENDLOOP.
 
     DATA(lt_limit_return) = check_daily_limit(
       iv_pernr      = ls_request-pernr
@@ -700,10 +792,10 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
         testrun         = ls_request-test
         text_format_imp = c_text_format
       TABLES
-        catsrecords_in  = lt_catsrecords_in
-        extensionin     = lt_extensionin
+        catsrecords_in  = ls_tables-catsrecords
+        extensionin     = ls_tables-extensionin
         catsrecords_out = lt_catsrecords_out
-        longtext        = lt_longtext
+        longtext        = ls_tables-longtext
         return          = lt_return.
 
     APPEND LINES OF lt_limit_return TO lt_return.
@@ -827,42 +919,11 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    DATA(lt_catsrecords_in)  = VALUE tt_bapicats1( ).
-    DATA(lt_extensionin)     = VALUE tt_bapicats7( ).
-    DATA(lt_longtext)        = VALUE tt_bapicats8( ).
+    DATA(ls_tables)          = build_insert_tables( iv_pernr           = ls_request-pernr
+                                                    it_records         = ls_request-records
+                                                    iv_idempotency_key = ls_request-idempotency_key ).
     DATA(lt_catsrecords_out) = VALUE tt_bapicats2( ).
     DATA(lt_return)          = VALUE tt_bapiret2( ).
-
-    LOOP AT ls_request-records INTO DATA(ls_record).
-      DATA(ls_bapicats1) = VALUE bapicats1( workdate       = ls_record-workdate
-                                             employeenumber = ls_request-pernr
-                                             catshours      = ls_record-hours
-                                             unit           = ls_record-unit
-                                             wagetype       = ls_record-wagetype
-                                             acttype        = ls_record-acttype
-                                             send_cctr      = ls_record-send_cctr
-                                             shorttext      = ls_record-shorttext
-                                             abs_att_type   = ls_record-attendance_type
-                                             starttime      = time_from_hhmm( ls_record-start_time )
-                                             endtime        = time_from_hhmm( ls_record-end_time )
-                                             extsystem      = c_extsystem
-                                             extapplication = c_extapplication
-                                             extdocumentno  = ls_request-idempotency_key
-                                             longtext       = xsdbool( ls_record-longtext IS NOT INITIAL ) ).
-
-      map_receiver( EXPORTING is_receiver  = ls_record-receiver
-                    CHANGING  cs_bapicats1 = ls_bapicats1 ).
-
-      APPEND ls_bapicats1 TO lt_catsrecords_in.
-      DATA(lv_row) = lines( lt_catsrecords_in ).
-      APPEND LINES OF split_longtext( iv_row  = lv_row
-                                      iv_text = ls_record-longtext ) TO lt_longtext.
-
-      APPEND VALUE bapicats7( structure  = 'BAPI_TE_CATSDB'
-                               valuepart1 = to_bapi_te_catsdb( iv_row = lv_row
-                                                                is_ext = ls_record-ext ) )
-             TO lt_extensionin.
-    ENDLOOP.
 
     DATA(lt_limit_return) = check_daily_limit( iv_pernr      = ls_request-pernr
                                                 it_records    = ls_request-records
@@ -874,10 +935,10 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
         testrun         = abap_false
         release_data    = ls_request-release
       TABLES
-        catsrecords_in  = lt_catsrecords_in
-        extensionin     = lt_extensionin
+        catsrecords_in  = ls_tables-catsrecords
+        extensionin     = ls_tables-extensionin
         catsrecords_out = lt_catsrecords_out
-        longtext        = lt_longtext
+        longtext        = ls_tables-longtext
         return          = lt_return.
 
     APPEND LINES OF lt_limit_return TO lt_return.
@@ -1026,7 +1087,7 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
         WHERE pernr = @ls_request-pernr
           AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
           AND status IN @lt_status_range
-        INTO TABLE @lt_rows.
+        INTO CORRESPONDING FIELDS OF TABLE @lt_rows.
     ELSE.
       SELECT counter, workdate, pernr,
              rkostl AS rec_cctr, raufnr AS rec_order,
@@ -1036,8 +1097,13 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
         FROM catsdb
         WHERE pernr = @ls_request-pernr
           AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
-        INTO TABLE @lt_rows.
+        INTO CORRESPONDING FIELDS OF TABLE @lt_rows.
     ENDIF.
+
+    LOOP AT lt_rows ASSIGNING FIELD-SYMBOL(<ls_row>) WHERE longtext = abap_true.
+      <ls_row>-longtext_text = longtext_to_string( read_longtext( iv_row     = 1
+                                                                  iv_counter = <ls_row>-counter ) ).
+    ENDLOOP.
 
     DATA(lv_total) = REDUCE catshours( INIT sum TYPE catshours
                                         FOR row IN lt_rows WHERE ( status <> c_status_changed AND status <> c_status_cancelled )
@@ -1191,38 +1257,9 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       CHANGING
         data        = ls_request ).
 
-    DATA(lt_catsrecords_in) = VALUE tt_bapicats1( ).
-    DATA(lt_extensionin)    = VALUE tt_bapicats7( ).
-    DATA(lt_longtext)       = VALUE tt_bapicats8( ).
-    DATA(lt_return)         = VALUE tt_bapiret2( ).
-
-    LOOP AT ls_request-records INTO DATA(ls_record).
-      DATA(ls_bapicats1) = VALUE bapicats1( workdate       = ls_record-workdate
-                                             employeenumber = ls_request-pernr
-                                             catshours      = ls_record-hours
-                                             unit           = ls_record-unit
-                                             wagetype       = ls_record-wagetype
-                                             acttype        = ls_record-acttype
-                                             send_cctr      = ls_record-send_cctr
-                                             shorttext      = ls_record-shorttext
-                                             abs_att_type   = ls_record-attendance_type
-                                             starttime      = time_from_hhmm( ls_record-start_time )
-                                             endtime        = time_from_hhmm( ls_record-end_time )
-                                             longtext       = xsdbool( ls_record-longtext IS NOT INITIAL ) ).
-
-      map_receiver( EXPORTING is_receiver  = ls_record-receiver
-                    CHANGING  cs_bapicats1 = ls_bapicats1 ).
-
-      APPEND ls_bapicats1 TO lt_catsrecords_in.
-      DATA(lv_row) = lines( lt_catsrecords_in ).
-      APPEND LINES OF split_longtext( iv_row  = lv_row
-                                      iv_text = ls_record-longtext ) TO lt_longtext.
-
-      APPEND VALUE bapicats7( structure  = 'BAPI_TE_CATSDB'
-                               valuepart1 = to_bapi_te_catsdb( iv_row = lv_row
-                                                                is_ext = ls_record-ext ) )
-             TO lt_extensionin.
-    ENDLOOP.
+    DATA(ls_tables) = build_insert_tables( iv_pernr   = ls_request-pernr
+                                           it_records = ls_request-records ).
+    DATA(lt_return) = VALUE tt_bapiret2( ).
 
     DATA(lt_limit_return) = check_daily_limit( iv_pernr      = ls_request-pernr
                                                 it_records    = ls_request-records
@@ -1233,9 +1270,9 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
         profile        = ls_request-profile
         testrun        = abap_true
       TABLES
-        catsrecords_in = lt_catsrecords_in
-        extensionin    = lt_extensionin
-        longtext       = lt_longtext
+        catsrecords_in = ls_tables-catsrecords
+        extensionin    = ls_tables-extensionin
+        longtext       = ls_tables-longtext
         return         = lt_return.
 
     APPEND LINES OF lt_limit_return TO lt_return.

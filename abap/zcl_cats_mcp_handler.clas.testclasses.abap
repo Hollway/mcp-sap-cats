@@ -26,6 +26,11 @@ CLASS ltc_handler DEFINITION FINAL
     METHODS daily_limit_within_norm FOR TESTING.
     METHODS daily_limit_exceeded FOR TESTING.
     METHODS daily_limit_sums_same_day FOR TESTING.
+    METHODS insert_tables_rows_match FOR TESTING.
+    METHODS insert_tables_idempotency FOR TESTING.
+    METHODS change_tables_rows_match FOR TESTING.
+    METHODS longtext_round_trip FOR TESTING.
+    METHODS longtext_itf_formats FOR TESTING.
 ENDCLASS.
 
 CLASS ltc_handler IMPLEMENTATION.
@@ -131,6 +136,78 @@ CLASS ltc_handler IMPLEMENTATION.
                                               iv_norm_hours = 8 ).
 
     cl_abap_unit_assert=>assert_equals( act = lines( lt_return ) exp = 1 ).
+  ENDMETHOD.
+
+  METHOD insert_tables_rows_match.
+    DATA(ls_tables) = cut->build_insert_tables(
+      iv_pernr   = c_no_pernr
+      it_records = VALUE #( ( workdate = c_no_date hours = 1 longtext = `первый` ext = VALUE #( prjct = 'P1' ) )
+                            ( workdate = c_no_date hours = 2 ext = VALUE #( prjct = 'P2' ) )
+                            ( workdate = c_no_date hours = 3 longtext = |а{ cl_abap_char_utilities=>newline }б| ext = VALUE #( prjct = 'P3' ) ) ) ).
+
+    cl_abap_unit_assert=>assert_equals( act = lines( ls_tables-catsrecords ) exp = 3 ).
+    cl_abap_unit_assert=>assert_equals( act = ls_tables-catsrecords[ 1 ]-longtext exp = abap_true ).
+    cl_abap_unit_assert=>assert_equals( act = ls_tables-catsrecords[ 2 ]-longtext exp = abap_false ).
+    cl_abap_unit_assert=>assert_equals( act = ls_tables-catsrecords[ 3 ]-employeenumber exp = c_no_pernr ).
+    cl_abap_unit_assert=>assert_initial( ls_tables-catsrecords[ 1 ]-extdocumentno ).
+
+    cl_abap_unit_assert=>assert_equals( act = lines( ls_tables-extensionin ) exp = 3 ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_tables-extensionin[ 2 ]
+      exp = VALUE bapicats7( structure  = 'BAPI_TE_CATSDB'
+                             valuepart1 = cut->to_bapi_te_catsdb( iv_row = 2 is_ext = VALUE #( prjct = 'P2' ) ) ) ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_tables-extensionin[ 3 ]-valuepart1
+      exp = cut->to_bapi_te_catsdb( iv_row = 3 is_ext = VALUE #( prjct = 'P3' ) ) ).
+
+    cl_abap_unit_assert=>assert_equals(
+      act = VALUE int4_table( FOR ls_line IN ls_tables-longtext ( ls_line-row ) )
+      exp = VALUE int4_table( ( 1 ) ( 3 ) ( 3 ) ) ).
+  ENDMETHOD.
+
+  METHOD insert_tables_idempotency.
+    DATA(ls_tables) = cut->build_insert_tables( iv_pernr           = c_no_pernr
+                                                it_records         = VALUE #( ( workdate = c_no_date hours = 1 ) )
+                                                iv_idempotency_key = 'KEY12345' ).
+
+    cl_abap_unit_assert=>assert_equals( act = ls_tables-catsrecords[ 1 ]-extsystem exp = 'MCP' ).
+    cl_abap_unit_assert=>assert_equals( act = ls_tables-catsrecords[ 1 ]-extapplication exp = 'CATS' ).
+    cl_abap_unit_assert=>assert_equals( act = ls_tables-catsrecords[ 1 ]-extdocumentno exp = 'KEY12345' ).
+  ENDMETHOD.
+
+  METHOD change_tables_rows_match.
+    DATA(ls_tables) = cut->build_change_tables(
+      iv_pernr   = c_no_pernr
+      it_records = VALUE #( ( counter = '000000000001' workdate = c_no_date hours = 1 )
+                            ( counter = '000000000002' workdate = c_no_date hours = 2 longtext = `текст` ) ) ).
+
+    cl_abap_unit_assert=>assert_equals( act = lines( ls_tables-catsrecords ) exp = 2 ).
+    cl_abap_unit_assert=>assert_equals( act = ls_tables-catsrecords[ 2 ]-counter exp = '000000000002' ).
+    cl_abap_unit_assert=>assert_equals( act = ls_tables-catsrecords[ 2 ]-longtext exp = abap_true ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_tables-extensionin[ 1 ]-valuepart1
+      exp = cut->to_bapi_te_catsdb( iv_row = 1 is_ext = VALUE #( ) ) ).
+    cl_abap_unit_assert=>assert_equals( act = lines( ls_tables-longtext ) exp = 1 ).
+    cl_abap_unit_assert=>assert_equals( act = ls_tables-longtext[ 1 ]-row exp = 2 ).
+  ENDMETHOD.
+
+  METHOD longtext_round_trip.
+    DATA(lv_text) = |первый абзац{ cl_abap_char_utilities=>newline }{ repeat( val = `б` occ = 200 ) }{ cl_abap_char_utilities=>newline }третий|.
+
+    cl_abap_unit_assert=>assert_equals(
+      act = cut->longtext_to_string( cut->split_longtext( iv_row = 1 iv_text = lv_text ) )
+      exp = lv_text ).
+  ENDMETHOD.
+
+  METHOD longtext_itf_formats.
+    DATA(lv_text) = cut->longtext_to_string( VALUE #( ( format_col = '/:' text_line = 'INCLUDE X' )
+                                                      ( format_col = '*'  text_line = 'один' )
+                                                      ( format_col = ' '  text_line = 'два' )
+                                                      ( format_col = '='  text_line = 'три' )
+                                                      ( format_col = '/'  text_line = 'четыре' ) ) ).
+
+    cl_abap_unit_assert=>assert_equals( act = lv_text
+                                        exp = |один дватри{ cl_abap_char_utilities=>newline }четыре| ).
   ENDMETHOD.
 
 ENDCLASS.
