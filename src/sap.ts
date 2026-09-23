@@ -44,6 +44,7 @@ export interface BapiMessage {
   id: string;
   number: string;
   text: string;
+  /** Номер записи во входном массиве с 1; 0 — сообщение относится ко всему вызову. */
   row?: number;
 }
 
@@ -112,7 +113,7 @@ export function formatMessages(messages: BapiMessage[]): string {
   if (messages.length === 0) return "";
   return messages
     .map((m) => {
-      const where = m.row === undefined ? "" : `строка ${m.row}: `;
+      const where = m.row ? `строка ${m.row}: ` : "";
       const severity = { E: "Ошибка", A: "Прерывание", W: "Предупреждение", I: "Информация", S: "Успешно" }[m.type];
       return `${severity} · ${where}${m.text} (${m.id}${m.number})`;
     })
