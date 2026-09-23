@@ -27,9 +27,15 @@ Node-сторона написана против этого контракта,
 | POST | `/capacity` | `CATSDB` + `DATE_CONVERT_TO_FACTORYDATE` (календарь `BY`) | — |
 | POST | `/validate` | `BAPI_CATIMESHEETMGR_INSERT`, `TESTRUN = 'X'` + дневной лимит | нет |
 | POST | `/insert` | `BAPI_CATIMESHEETMGR_INSERT` + дневной лимит | `BAPI_TRANSACTION_COMMIT` в том же вызове |
-| POST | `/change` | `BAPI_CATIMESHEETMGR_CHANGE` | то же |
+| POST | `/change` | `BAPI_CATIMESHEETMGR_CHANGE` + дневной лимит (часы изменяемых записей не складываются с новыми) | то же |
 | POST | `/delete` | `BAPI_CATIMESHEETMGR_DELETE` | то же |
 | POST | `/release` | `BAPI_CATIMESHEETMGR_CHANGE`, `RELEASE_DATA = 'X'`, ресенд строки из `CATSDB` | то же |
+| POST | `/whoami` | `PA0105` (подтип `0001`) по `sy-uname`, `PA0001`, `T527X` | — |
+| POST | `/projects` | `ZBTPRJCT`/`ZBTPRJCTT`, с `prjct` — `ZBTPROJECT`/`ZBTREQSPT` | — |
+
+Дневной лимит, `/capacity` и `total_hours` в `/read` не учитывают сторнированные записи (статус `60`): они сохраняют часы в `CATSDB`.
+
+Подробный текст записи — поле `longtext` (строка с переводами строк) в `records` маршрутов `/validate`, `/insert`, `/change`; уходит в параметр `LONGTEXT` BAPI (`BAPICATS8`, по 132 символа). `/read` возвращает только признак `longtext`.
 
 **Фиксация обязана происходить внутри того же обращения к хендлеру, что и вызов BAPI.** При stateless HTTP каждый запрос — новая LUW, и запись пропадёт молча.
 

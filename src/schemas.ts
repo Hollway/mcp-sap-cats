@@ -66,6 +66,11 @@ export const catsRecord = z
     start_time: z.string().regex(/^\d{2}:\d{2}$/).optional(),
     end_time: z.string().regex(/^\d{2}:\d{2}$/).optional(),
     attendance_type: z.string().max(4).optional(),
+    longtext: z
+      .string()
+      .max(4000)
+      .optional()
+      .describe("Подробный текст записи, если 40 символов shorttext мало; переводы строк сохраняются"),
     ext: extFields,
   })
   .strict();

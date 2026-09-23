@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { catsRecord, receiver } from "../dist/schemas.js";
-import { SapClient, SapError, formatMessages, hasErrors } from "../dist/sap.js";
+import { SapClient, SapError, formatMessages, hasErrors, isLocked } from "../dist/sap.js";
 
 const baseRecord = { workdate: "2026-09-21", hours: 2, ext: { prjct: "PRJ01" } };
 
@@ -28,6 +28,11 @@ test("catsRecord: формат даты и времени", () => {
   assert.equal(catsRecord.safeParse({ ...baseRecord, workdate: "21.09.2026" }).success, false);
   assert.equal(catsRecord.safeParse({ ...baseRecord, start_time: "9:00" }).success, false);
   assert.equal(catsRecord.safeParse({ ...baseRecord, start_time: "09:00", end_time: "11:00" }).success, true);
+});
+
+test("catsRecord: longtext необязателен и ограничен 4000 символами", () => {
+  assert.equal(catsRecord.safeParse({ ...baseRecord, longtext: "a\nb" }).success, true);
+  assert.equal(catsRecord.safeParse({ ...baseRecord, longtext: "x".repeat(4001) }).success, false);
 });
 
 test("catsRecord: неизвестные поля отвергаются", () => {
@@ -63,7 +68,16 @@ test("hasErrors: E и A — ошибки, остальное нет", () => {
   assert.equal(hasErrors([{ type: "A", id: "", number: "", text: "" }]), true);
 });
 
-const cfg = { url: "https://sap.example/sap/bc/zcats", client: "102", user: "u", password: "p", profile: "TIME_D1" };
+const cfg = {
+  url: "https://sap.example/sap/bc/zcats",
+  client: "102",
+  user: "u",
+  password: "p",
+  profile: "TIME_D1",
+  timeoutMs: 1_000,
+  lockRetries: 2,
+  lockRetryDelayMs: 1,
+};
 
 function withFetch(handler, fn) {
   const original = globalThis.fetch;
@@ -106,3 +120,70 @@ for (const [status, pattern] of [
       },
     ));
 }
+
+const locked = { messages: [{ type: "E", id: "LR", number: "002", text: "Транзакцию блокирует пользователь", row: 0 }] };
+
+test("isLocked: только E/LR/002", () => {
+  assert.equal(isLocked(locked.messages), true);
+  assert.equal(isLocked([{ ...locked.messages[0], type: "W" }]), false);
+  assert.equal(isLocked([{ ...locked.messages[0], number: "199" }]), false);
+  assert.equal(isLocked(undefined), false);
+});
+
+test("SapClient: LR2 повторяется и проходит со следующей попытки", () => {
+  let calls = 0;
+  return withFetch(
+    async () => {
+      calls++;
+      const payload = calls === 1 ? locked : { committed: true, messages: [] };
+      return new Response(JSON.stringify(payload), { status: 200 });
+    },
+    async () => {
+      assert.deepEqual(await new SapClient(cfg).call("/insert", "POST", {}), { committed: true, messages: [] });
+      assert.equal(calls, 2);
+    },
+  );
+});
+
+test("SapClient: после исчерпания повторов возвращается последний ответ с LR2", () => {
+  let calls = 0;
+  return withFetch(
+    async () => {
+      calls++;
+      return new Response(JSON.stringify(locked), { status: 200 });
+    },
+    async () => {
+      assert.deepEqual(await new SapClient(cfg).call("/delete", "POST", {}), locked);
+      assert.equal(calls, 1 + cfg.lockRetries);
+    },
+  );
+});
+
+test("SapClient: другие ошибки BAPI не повторяются", () => {
+  let calls = 0;
+  const failed = { messages: [{ type: "E", id: "MCP", number: "002", text: "Лимит", row: 1 }] };
+  return withFetch(
+    async () => {
+      calls++;
+      return new Response(JSON.stringify(failed), { status: 200 });
+    },
+    async () => {
+      await new SapClient(cfg).call("/insert", "POST", {});
+      assert.equal(calls, 1);
+    },
+  );
+});
+
+test("SapClient: таймаут превращается в SapError с подсказкой про idempotency_key", () =>
+  withFetch(
+    (url, init) =>
+      new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(init.signal.reason))),
+    async () => {
+      await assert.rejects(new SapClient({ ...cfg, timeoutMs: 50 }).call("/insert", "POST", {}), (error) => {
+        assert.ok(error instanceof SapError);
+        assert.match(error.message, /не ответил за 0.05 с/);
+        assert.match(error.message, /idempotency_key/);
+        return true;
+      });
+    },
+  ));
