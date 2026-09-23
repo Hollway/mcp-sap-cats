@@ -320,6 +320,7 @@ public section.
       c_extsystem      TYPE catsdb-extsystem      VALUE 'MCP',
       c_extapplication TYPE catsdb-extapplication VALUE 'CATS',
       c_calendar       TYPE scal-fcalid           VALUE 'BY',
+      c_status_changed   TYPE catsdb-status       VALUE '50',
       c_status_cancelled TYPE catsdb-status       VALUE '60',
       c_text_format      TYPE bapicats6-text_format_imp VALUE 'ITF',
       c_ytr_deleted      TYPE zytrproj-status          VALUE '7'.
@@ -438,7 +439,7 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       FROM catsdb
       WHERE pernr = @iv_pernr
         AND workdate IN @lt_date_range
-        AND status <> @c_status_cancelled
+        AND status NOT IN ( @c_status_changed, @c_status_cancelled )
       INTO TABLE @lt_rows.
 
     LOOP AT lt_new_by_day INTO DATA(ls_new_day).
@@ -591,7 +592,7 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       FROM catsdb
       WHERE pernr = @ls_request-pernr
         AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
-        AND status <> @c_status_cancelled
+        AND status NOT IN ( @c_status_changed, @c_status_cancelled )
       GROUP BY workdate
       INTO TABLE @lt_booked.
 
@@ -1039,7 +1040,7 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
     ENDIF.
 
     DATA(lv_total) = REDUCE catshours( INIT sum TYPE catshours
-                                        FOR row IN lt_rows WHERE ( status <> c_status_cancelled )
+                                        FOR row IN lt_rows WHERE ( status <> c_status_changed AND status <> c_status_cancelled )
                                         NEXT sum = sum + row-hours ).
 
     DATA(ls_response) = VALUE ts_read_response( rows        = lt_rows
