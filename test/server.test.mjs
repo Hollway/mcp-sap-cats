@@ -52,10 +52,10 @@ after(async () => {
 const call = async (name, args) => {
   requests.length = 0;
   const result = await client.callTool({ name, arguments: args });
-  return { ...result, text: result.content.map((c) => c.text).join("\n"), sent: requests[0] };
+  return { ...result, text: result.content.map((c) => c.text).join("\n"), sent: requests[0], all: [...requests] };
 };
 
-const record = { workdate: "2026-09-21", hours: 2, ext: { prjct: "PRJ01" } };
+const record = { workdate: "2026-09-21", hours: 2, ext: { prjct: "PRJ01", descr: "Работа" } };
 
 test("сервер публикует все девять инструментов", async () => {
   const { tools } = await client.listTools();
@@ -83,6 +83,57 @@ test("cats_whoami: ответ без messages, ошибка MCP003 — isError",
   const missing = await call("cats_whoami", {});
   assert.equal(missing.isError, true);
   assert.match(missing.text, /Нет табельного \(MCP003\)/);
+});
+
+test("cats_projects: поиск по ТЗ, новые первыми, limit и статус Трекера", async () => {
+  replies.set("/projects", [200, {
+    projects: [{ prjct: "PRJ01", text: "Проект" }],
+    requests: [
+      { prjct: "PRJ01", rqsnb: 1, text: "Старое ТЗ", ytr_key: "", ytr_status: "" },
+      { prjct: "PRJ01", rqsnb: 562, text: "ZSTMAT остатки", ytr_key: "SAP-19109", ytr_status: "4" },
+      { prjct: "PRJ01", rqsnb: 600, text: "ZSTMAT транзакция", ytr_key: "SAP-19200", ytr_status: "3" },
+    ],
+    messages: [],
+  }]);
+  const result = await call("cats_projects", { prjct: "PRJ01", search: "zstmat", limit: 1 });
+  assert.deepEqual(result.sent.body, { prjct: "PRJ01", search: "zstmat" });
+  const payload = JSON.parse(result.text);
+  assert.equal(payload.requests_total, 2);
+  assert.deepEqual(payload.requests.map((r) => r.rqsnb), ["600"]);
+  assert.equal(payload.requests[0].ytr_status_text, "В работе");
+});
+
+test("ext.ytr_key превращается в проект и номер ТЗ до записи", async () => {
+  replies.set("/projects", [200, { projects: [], requests: [{ prjct: "ОЗИПП", rqsnb: 562, text: "ТЗ", ytr_key: "SAP-19109", ytr_status: "4" }], messages: [] }]);
+  replies.set("/insert", [200, { created: [], committed: true, messages: [] }]);
+  const result = await call("cats_insert", {
+    pernr: "12345",
+    records: [
+      { workdate: "2026-09-21", hours: 1, ext: { ytr_key: "SAP-19109" } },
+      { workdate: "2026-09-22", hours: 1, ext: { ytr_key: "SAP-19109" } },
+    ],
+    idempotency_key: "TEST0002",
+  });
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(result.all.map((r) => r.route), ["/projects", "/insert"]);
+  assert.deepEqual(result.all[1].body.records[1].ext, { prjct: "ОЗИПП", rqsnb: "562" });
+});
+
+test("ext.ytr_key: неоднозначный ключ и расхождение с парой — ошибка без записи", async () => {
+  replies.set("/projects", [200, { projects: [], requests: [
+    { prjct: "А", rqsnb: 1, ytr_key: "SAP-1", ytr_status: "" },
+    { prjct: "Б", rqsnb: 1, ytr_key: "SAP-1", ytr_status: "" },
+  ], messages: [] }]);
+  const ambiguous = await call("cats_insert", { pernr: "12345", records: [{ ...record, ext: { ytr_key: "SAP-1" } }], idempotency_key: "TEST0003" });
+  assert.equal(ambiguous.isError, true);
+  assert.match(ambiguous.text, /нескольким парам \(А\/1, Б\/1\)/);
+  assert.deepEqual(ambiguous.all.map((r) => r.route), ["/projects"]);
+
+  replies.set("/projects", [200, { projects: [], requests: [{ prjct: "ОЗИПП", rqsnb: 562, ytr_key: "SAP-19109", ytr_status: "4" }], messages: [] }]);
+  const mismatch = await call("cats_validate", { pernr: "12345", records: [{ ...record, ext: { ytr_key: "SAP-19109", prjct: "PRJ01" } }] });
+  assert.equal(mismatch.isError, true);
+  assert.match(mismatch.text, /это ОЗИПП\/562/);
+  assert.deepEqual(mismatch.all.map((r) => r.route), ["/projects"]);
 });
 
 test("cats_projects: параметры поиска уходят в хендлер", async () => {
@@ -147,6 +198,7 @@ test("невалидный ввод отвергается до обращени
     ["cats_insert", { pernr: "12345", records: [{ ...record, ext: {} }], idempotency_key: "TEST0001" }],
     ["cats_validate", { pernr: "12345", records: [] }],
     ["cats_delete", { counters: [] }],
+    ["cats_insert", { pernr: "12345", records: [{ ...record, ext: { prjct: "PRJ01" } }], idempotency_key: "TEST0001" }],
   ];
   for (const [name, args] of cases) {
     const result = await call(name, args);

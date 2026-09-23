@@ -1,11 +1,11 @@
-CLASS zcl_cats_mcp_handler DEFINITION
-  PUBLIC
-  FINAL
-  CREATE PUBLIC.
+class ZCL_CATS_MCP_HANDLER definition
+  public
+  final
+  create public .
 
-  PUBLIC SECTION.
-    INTERFACES if_http_extension.
+public section.
 
+  interfaces IF_HTTP_EXTENSION .
   PRIVATE SECTION.
     TYPES:
       BEGIN OF ts_cats_row,
@@ -232,6 +232,7 @@ CLASS zcl_cats_mcp_handler DEFINITION
         prjct      TYPE catsdb-zzprjct,
         descr      TYPE catsdb-zzdescr,
         orgunit    TYPE catsdb-zzorgunit,
+        longtext   TYPE catsdb-longtext,
       END OF ts_catsdb_full,
       tt_catsdb_full TYPE STANDARD TABLE OF ts_catsdb_full WITH EMPTY KEY,
       tt_counter_range TYPE RANGE OF catsdb-counter,
@@ -286,8 +287,9 @@ CLASS zcl_cats_mcp_handler DEFINITION
       END OF ts_whoami_response,
 
       BEGIN OF ts_projects_request,
-        search TYPE string,
-        prjct  TYPE zbtprjct-prjct,
+        search  TYPE string,
+        prjct   TYPE zbtprjct-prjct,
+        ytr_key TYPE zytrproj-id_ytr,
       END OF ts_projects_request,
 
       BEGIN OF ts_project,
@@ -297,11 +299,14 @@ CLASS zcl_cats_mcp_handler DEFINITION
       tt_project TYPE STANDARD TABLE OF ts_project WITH EMPTY KEY,
 
       BEGIN OF ts_request_row,
-        rqsnb     TYPE zbtproject-rqsnb,
-        text      TYPE zbtreqspt-rqsnm,
-        date_from TYPE zbtproject-fcbdt,
-        date_to   TYPE zbtproject-fcedt,
-        rejected  TYPE zbtproject-is_rejected,
+        prjct      TYPE zbtproject-prjct,
+        rqsnb      TYPE zbtproject-rqsnb,
+        text       TYPE zbtreqspt-rqsnm,
+        ytr_key    TYPE zytrproj-id_ytr,
+        ytr_status TYPE zytrproj-status,
+        date_from  TYPE zbtproject-fcbdt,
+        date_to    TYPE zbtproject-fcedt,
+        rejected   TYPE zbtproject-is_rejected,
       END OF ts_request_row,
       tt_request_row TYPE STANDARD TABLE OF ts_request_row WITH EMPTY KEY,
 
@@ -315,7 +320,9 @@ CLASS zcl_cats_mcp_handler DEFINITION
       c_extsystem      TYPE catsdb-extsystem      VALUE 'MCP',
       c_extapplication TYPE catsdb-extapplication VALUE 'CATS',
       c_calendar       TYPE scal-fcalid           VALUE 'BY',
-      c_status_cancelled TYPE catsdb-status       VALUE '60'.
+      c_status_cancelled TYPE catsdb-status       VALUE '60',
+      c_text_format      TYPE bapicats6-text_format_imp VALUE 'ITF',
+      c_ytr_deleted      TYPE zytrproj-status          VALUE '7'.
 
     METHODS route_read
       IMPORTING server TYPE REF TO if_http_server.
@@ -398,10 +405,66 @@ CLASS zcl_cats_mcp_handler DEFINITION
       IMPORTING iv_row          TYPE i
                 iv_text         TYPE string
       RETURNING VALUE(rt_lines) TYPE tt_bapicats8.
+
+    METHODS read_longtext
+      IMPORTING iv_row          TYPE i
+                iv_counter      TYPE catsdb-counter
+      RETURNING VALUE(rt_lines) TYPE tt_bapicats8.
 ENDCLASS.
 
 
-CLASS zcl_cats_mcp_handler IMPLEMENTATION.
+
+CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
+
+
+  METHOD check_daily_limit.
+    CHECK it_records IS NOT INITIAL.
+
+    DATA(lt_new_by_day) = VALUE tt_booked_day( ).
+    LOOP AT it_records INTO DATA(ls_record).
+      READ TABLE lt_new_by_day WITH KEY workdate = ls_record-workdate ASSIGNING FIELD-SYMBOL(<ls_new_day>).
+      IF sy-subrc = 0.
+        <ls_new_day>-hours = <ls_new_day>-hours + ls_record-hours.
+      ELSE.
+        APPEND VALUE ts_booked_day( workdate = ls_record-workdate hours = ls_record-hours ) TO lt_new_by_day.
+      ENDIF.
+    ENDLOOP.
+
+    DATA(lt_date_range) = VALUE tt_workdate_range( FOR ls_range_day IN lt_new_by_day
+                                                    ( sign = 'I' option = 'EQ' low = ls_range_day-workdate ) ).
+
+    DATA(lt_rows) = VALUE tt_hours_row( ).
+    SELECT counter, workdate, catshours AS hours
+      FROM catsdb
+      WHERE pernr = @iv_pernr
+        AND workdate IN @lt_date_range
+        AND status <> @c_status_cancelled
+      INTO TABLE @lt_rows.
+
+    LOOP AT lt_new_by_day INTO DATA(ls_new_day).
+      DATA(lv_existing) = REDUCE catsdb-catshours( INIT sum TYPE catsdb-catshours
+                                                    FOR ls_row IN lt_rows WHERE ( workdate = ls_new_day-workdate )
+                                                    NEXT sum = sum + COND catsdb-catshours( WHEN line_exists( it_exclude[ table_line = ls_row-counter ] )
+                                                                                            THEN 0
+                                                                                            ELSE ls_row-hours ) ).
+      DATA(lv_total)    = lv_existing + ls_new_day-hours.
+
+      IF lv_total > iv_norm_hours.
+        APPEND VALUE bapiret2( type    = 'E'
+                                id      = 'MCP'
+                                number  = '002'
+                                message = |Превышена дневная норма { iv_norm_hours DECIMALS = 2 } ч на { ls_new_day-workdate DATE = ISO }: | &&
+                                          |уже { lv_existing DECIMALS = 2 } + новые { ls_new_day-hours DECIMALS = 2 } = { lv_total DECIMALS = 2 }| )
+               TO rt_return.
+      ENDIF.
+    ENDLOOP.
+  ENDMETHOD.
+
+
+  METHOD has_errors.
+    rv_result = xsdbool( line_exists( it_return[ type = 'E' ] ) OR line_exists( it_return[ type = 'A' ] ) ).
+  ENDMETHOD.
+
 
   METHOD if_http_extension~handle_request.
     DATA(lv_path) = server->request->get_header_field( name = '~path_info' ).
@@ -434,29 +497,88 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
     ENDTRY.
   ENDMETHOD.
 
+
+  METHOD map_receiver.
+    IF is_receiver-order IS NOT INITIAL.
+      cs_bapicats1-rec_order = is_receiver-order.
+    ELSEIF is_receiver-cost_center IS NOT INITIAL.
+      cs_bapicats1-rec_cctr = is_receiver-cost_center.
+      cs_bapicats1-co_area  = is_receiver-co_area.
+    ELSEIF is_receiver-wbs IS NOT INITIAL.
+      cs_bapicats1-wbs_element = is_receiver-wbs.
+    ELSEIF is_receiver-network IS NOT INITIAL.
+      cs_bapicats1-network      = is_receiver-network.
+      cs_bapicats1-activity     = is_receiver-activity.
+      cs_bapicats1-sub_activity = is_receiver-sub_activity.
+    ELSEIF is_receiver-sales_order IS NOT INITIAL.
+      cs_bapicats1-recsaleord = is_receiver-sales_order.
+      cs_bapicats1-recitem    = is_receiver-item.
+    ELSEIF is_receiver-purchase_order IS NOT INITIAL.
+      cs_bapicats1-po_number = is_receiver-purchase_order.
+      cs_bapicats1-po_item   = is_receiver-item.
+    ENDIF.
+  ENDMETHOD.
+
+
+  METHOD map_receiver_bapicats3.
+    IF is_receiver-order IS NOT INITIAL.
+      cs_bapicats3-rec_order = is_receiver-order.
+    ELSEIF is_receiver-cost_center IS NOT INITIAL.
+      cs_bapicats3-rec_cctr = is_receiver-cost_center.
+      cs_bapicats3-co_area  = is_receiver-co_area.
+    ELSEIF is_receiver-wbs IS NOT INITIAL.
+      cs_bapicats3-wbs_element = is_receiver-wbs.
+    ELSEIF is_receiver-network IS NOT INITIAL.
+      cs_bapicats3-network      = is_receiver-network.
+      cs_bapicats3-activity     = is_receiver-activity.
+      cs_bapicats3-sub_activity = is_receiver-sub_activity.
+    ELSEIF is_receiver-sales_order IS NOT INITIAL.
+      cs_bapicats3-recsaleord = is_receiver-sales_order.
+      cs_bapicats3-recitem    = is_receiver-item.
+    ELSEIF is_receiver-purchase_order IS NOT INITIAL.
+      cs_bapicats3-po_number = is_receiver-purchase_order.
+      cs_bapicats3-po_item   = is_receiver-item.
+    ENDIF.
+  ENDMETHOD.
+
+
   METHOD read_body.
     rv_json = server->request->get_cdata( ).
   ENDMETHOD.
 
-  METHOD send_json.
-    server->response->set_status( code = code reason = '' ).
-    server->response->set_header_field( name = 'content-type' value = 'application/json; charset=utf-8' ).
-    server->response->set_cdata( data = json ).
+
+  METHOD read_longtext.
+    DATA(lv_language) = VALUE stxh-tdspras( ).
+    SELECT SINGLE tdspras
+      FROM stxh
+      WHERE tdobject = 'CATS'
+        AND tdid     = 'CATS'
+        AND tdname   = @iv_counter
+      INTO @lv_language.
+    CHECK sy-subrc = 0.
+
+    DATA(lt_lines) = VALUE tline_tab( ).
+    CALL FUNCTION 'READ_TEXT'
+      EXPORTING
+        id       = 'CATS'
+        language = lv_language
+        name     = CONV tdobname( iv_counter )
+        object   = 'CATS'
+      TABLES
+        lines    = lt_lines
+      EXCEPTIONS
+        OTHERS   = 1.
+    CHECK sy-subrc = 0.
+
+    rt_lines = VALUE #( FOR ls_line IN lt_lines
+                        ( row = iv_row format_col = ls_line-tdformat text_line = ls_line-tdline ) ).
   ENDMETHOD.
 
-  METHOD send_error.
-    DATA(lv_json) = |\{"messages":[\{"type":"E","id":"MCP","number":"000","text":"{ message }"\}]\}|.
-    send_json( server = server code = code json = lv_json ).
-  ENDMETHOD.
 
-  METHOD route_stub.
-    send_error( server = server code = 501 message = |Маршрут { route } ещё не реализован| ).
-  ENDMETHOD.
-
-  METHOD route_read.
+  METHOD route_capacity.
     DATA(lv_body) = read_body( server ).
 
-    DATA(ls_request) = VALUE ts_read_request( ).
+    DATA(ls_request) = VALUE ts_capacity_request( norm_hours = '8' ).
     /ui2/cl_json=>deserialize(
       EXPORTING
         json        = lv_body
@@ -464,50 +586,64 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
       CHANGING
         data        = ls_request ).
 
-    DATA(lt_rows) = VALUE tt_cats_row( ).
-    DATA(lt_status_range) = VALUE tt_status_range( FOR lv_s IN ls_request-status
-                                                    ( sign = 'I' option = 'EQ' low = lv_s ) ).
+    DATA(lt_booked) = VALUE tt_booked_day( ).
+    SELECT workdate, SUM( catshours ) AS hours
+      FROM catsdb
+      WHERE pernr = @ls_request-pernr
+        AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
+        AND status <> @c_status_cancelled
+      GROUP BY workdate
+      INTO TABLE @lt_booked.
 
-    IF ls_request-status IS NOT INITIAL.
-      SELECT counter, workdate, pernr,
-             rkostl AS rec_cctr, raufnr AS rec_order,
-             lstar AS acttype, lgart AS wagetype, meinh AS unit,
-             catshours AS hours, status,
-             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit, longtext
-        FROM catsdb
-        WHERE pernr = @ls_request-pernr
-          AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
-          AND status IN @lt_status_range
-        INTO TABLE @lt_rows.
-    ELSE.
-      SELECT counter, workdate, pernr,
-             rkostl AS rec_cctr, raufnr AS rec_order,
-             lstar AS acttype, lgart AS wagetype, meinh AS unit,
-             catshours AS hours, status,
-             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit, longtext
-        FROM catsdb
-        WHERE pernr = @ls_request-pernr
-          AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
-        INTO TABLE @lt_rows.
-    ENDIF.
+    DATA(lt_days)       = VALUE tt_capacity_day( ).
+    DATA(lv_total_free) = VALUE catsdb-catshours( ).
+    DATA(lv_date)       = ls_request-date_from.
 
-    DATA(lv_total) = REDUCE catshours( INIT sum TYPE catshours
-                                        FOR row IN lt_rows WHERE ( status <> c_status_cancelled )
-                                        NEXT sum = sum + row-hours ).
+    WHILE lv_date <= ls_request-date_to.
+      DATA(lv_flag) = VALUE scal-indicator( ).
+      CALL FUNCTION 'DATE_CONVERT_TO_FACTORYDATE'
+        EXPORTING
+          date                 = lv_date
+          factory_calendar_id  = c_calendar
+        IMPORTING
+          workingday_indicator = lv_flag
+        EXCEPTIONS
+          date_invalid               = 1
+          date_before_range          = 2
+          date_after_range           = 3
+          factory_calendar_not_found = 4
+          OTHERS                     = 5.
 
-    DATA(ls_response) = VALUE ts_read_response( rows        = lt_rows
-                                                  total_hours = lv_total
-                                                  messages    = VALUE #( ) ).
+      DATA(lv_is_workday) = xsdbool( sy-subrc = 0 AND lv_flag = space ).
+      DATA(lv_booked)     = VALUE catsdb-catshours( lt_booked[ workdate = lv_date ]-hours OPTIONAL ).
+      DATA(lv_norm)       = COND catsdb-catshours( WHEN lv_is_workday = abap_true THEN ls_request-norm_hours ELSE 0 ).
+      DATA(lv_free)       = lv_norm - lv_booked.
+
+      APPEND VALUE ts_capacity_day( date       = lv_date
+                                     is_workday = lv_is_workday
+                                     booked     = lv_booked
+                                     free       = lv_free )
+             TO lt_days.
+
+      lv_total_free = lv_total_free + lv_free.
+      lv_date       = lv_date + 1.
+    ENDWHILE.
+
+    DATA(ls_response) = VALUE ts_capacity_response( days       = lt_days
+                                                      norm_hours = ls_request-norm_hours
+                                                      calendar   = c_calendar
+                                                      total_free = lv_total_free ).
 
     DATA(lv_json) = /ui2/cl_json=>serialize( data        = ls_response
                                               pretty_name = /ui2/cl_json=>pretty_mode-low_case ).
     send_json( server = server code = 200 json = lv_json ).
   ENDMETHOD.
 
-  METHOD route_validate.
+
+  METHOD route_change.
     DATA(lv_body) = read_body( server ).
 
-    DATA(ls_request) = VALUE ts_validate_request( norm_hours = '8' ).
+    DATA(ls_request) = VALUE ts_change_request( norm_hours = '8' ).
     /ui2/cl_json=>deserialize(
       EXPORTING
         json        = lv_body
@@ -515,13 +651,15 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
       CHANGING
         data        = ls_request ).
 
-    DATA(lt_catsrecords_in) = VALUE tt_bapicats1( ).
-    DATA(lt_extensionin)    = VALUE tt_bapicats7( ).
-    DATA(lt_longtext)       = VALUE tt_bapicats8( ).
-    DATA(lt_return)         = VALUE tt_bapiret2( ).
+    DATA(lt_catsrecords_in)  = VALUE tt_bapicats3( ).
+    DATA(lt_extensionin)     = VALUE tt_bapicats7( ).
+    DATA(lt_longtext)        = VALUE tt_bapicats8( ).
+    DATA(lt_catsrecords_out) = VALUE tt_bapicats2( ).
+    DATA(lt_return)          = VALUE tt_bapiret2( ).
 
     LOOP AT ls_request-records INTO DATA(ls_record).
-      DATA(ls_bapicats1) = VALUE bapicats1( workdate       = ls_record-workdate
+      DATA(ls_bapicats3) = VALUE bapicats3( counter        = ls_record-counter
+                                             workdate       = ls_record-workdate
                                              employeenumber = ls_request-pernr
                                              catshours      = ls_record-hours
                                              unit           = ls_record-unit
@@ -534,10 +672,10 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
                                              endtime        = time_from_hhmm( ls_record-end_time )
                                              longtext       = xsdbool( ls_record-longtext IS NOT INITIAL ) ).
 
-      map_receiver( EXPORTING is_receiver  = ls_record-receiver
-                    CHANGING  cs_bapicats1 = ls_bapicats1 ).
+      map_receiver_bapicats3( EXPORTING is_receiver  = ls_record-receiver
+                               CHANGING  cs_bapicats3 = ls_bapicats3 ).
 
-      APPEND ls_bapicats1 TO lt_catsrecords_in.
+      APPEND ls_bapicats3 TO lt_catsrecords_in.
       DATA(lv_row) = lines( lt_catsrecords_in ).
       APPEND LINES OF split_longtext( iv_row  = lv_row
                                       iv_text = ls_record-longtext ) TO lt_longtext.
@@ -548,28 +686,108 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
              TO lt_extensionin.
     ENDLOOP.
 
-    DATA(lt_limit_return) = check_daily_limit( iv_pernr      = ls_request-pernr
-                                                it_records    = ls_request-records
-                                                iv_norm_hours = ls_request-norm_hours ).
+    DATA(lt_limit_return) = check_daily_limit(
+      iv_pernr      = ls_request-pernr
+      it_records    = VALUE #( FOR ls_changed IN ls_request-records
+                               ( workdate = ls_changed-workdate hours = ls_changed-hours ) )
+      iv_norm_hours = ls_request-norm_hours
+      it_exclude    = VALUE #( FOR ls_changed IN ls_request-records ( ls_changed-counter ) ) ).
 
-    CALL FUNCTION 'BAPI_CATIMESHEETMGR_INSERT'
+    CALL FUNCTION 'BAPI_CATIMESHEETMGR_CHANGE'
       EXPORTING
-        profile        = ls_request-profile
-        testrun        = abap_true
+        profile         = ls_request-profile
+        testrun         = ls_request-test
+        text_format_imp = c_text_format
       TABLES
-        catsrecords_in = lt_catsrecords_in
-        extensionin    = lt_extensionin
-        longtext       = lt_longtext
-        return         = lt_return.
+        catsrecords_in  = lt_catsrecords_in
+        extensionin     = lt_extensionin
+        catsrecords_out = lt_catsrecords_out
+        longtext        = lt_longtext
+        return          = lt_return.
 
     APPEND LINES OF lt_limit_return TO lt_return.
 
-    DATA(ls_response) = VALUE ts_validate_response( messages = to_messages( lt_return ) ).
+    DATA(lv_committed) = abap_false.
+
+    IF ls_request-test = abap_false.
+      IF has_errors( lt_return ) = abap_false.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = abap_true.
+        lv_committed = abap_true.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      ENDIF.
+    ENDIF.
+
+    DATA(lt_changed) = VALUE tt_changed_row(
+      FOR ls_out IN lt_catsrecords_out INDEX INTO lv_idx
+      ( row = lv_idx counter = ls_out-counter workdate = ls_out-workdate status = ls_out-status ) ).
+
+    DATA(ls_response) = VALUE ts_change_response( changed   = lt_changed
+                                                    committed = lv_committed
+                                                    messages  = to_messages( lt_return ) ).
 
     DATA(lv_json) = /ui2/cl_json=>serialize( data        = ls_response
                                               pretty_name = /ui2/cl_json=>pretty_mode-low_case ).
     send_json( server = server code = 200 json = lv_json ).
   ENDMETHOD.
+
+
+  METHOD route_delete.
+    DATA(lv_body) = read_body( server ).
+
+    DATA(ls_request) = VALUE ts_delete_request( ).
+    /ui2/cl_json=>deserialize(
+      EXPORTING
+        json        = lv_body
+        pretty_name = /ui2/cl_json=>pretty_mode-low_case
+      CHANGING
+        data        = ls_request ).
+
+    DATA(lt_catsrecords) = VALUE tt_bapicats4( ).
+    DATA(lt_return)       = VALUE tt_bapiret2( ).
+
+    LOOP AT ls_request-counters INTO DATA(lv_counter).
+      APPEND VALUE bapicats4( counter = lv_counter ) TO lt_catsrecords.
+    ENDLOOP.
+
+    CALL FUNCTION 'BAPI_CATIMESHEETMGR_DELETE'
+      EXPORTING
+        testrun     = ls_request-test
+      TABLES
+        catsrecords = lt_catsrecords
+        return      = lt_return.
+
+    DATA(lv_committed) = abap_false.
+
+    IF ls_request-test = abap_false.
+      IF has_errors( lt_return ) = abap_false.
+        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+          EXPORTING
+            wait = abap_true.
+        lv_committed = abap_true.
+      ELSE.
+        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+      ENDIF.
+    ENDIF.
+
+    DATA(lt_deleted) = VALUE tt_deleted_row( ).
+    IF lv_committed = abap_true.
+      lt_deleted = VALUE tt_deleted_row(
+        FOR lv_c IN ls_request-counters INDEX INTO lv_idx
+        ( row = lv_idx counter = lv_c ) ).
+    ENDIF.
+
+    DATA(ls_response) = VALUE ts_delete_response( deleted   = lt_deleted
+                                                    committed = lv_committed
+                                                    messages  = to_messages( lt_return ) ).
+
+    DATA(lv_json) = /ui2/cl_json=>serialize( data        = ls_response
+                                              pretty_name = /ui2/cl_json=>pretty_mode-low_case ).
+    send_json( server = server code = 200 json = lv_json ).
+  ENDMETHOD.
+
 
   METHOD route_insert.
     DATA(lv_body) = read_body( server ).
@@ -688,10 +906,11 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
     send_json( server = server code = 200 json = lv_json ).
   ENDMETHOD.
 
-  METHOD route_change.
+
+  METHOD route_projects.
     DATA(lv_body) = read_body( server ).
 
-    DATA(ls_request) = VALUE ts_change_request( norm_hours = '8' ).
+    DATA(ls_request) = VALUE ts_projects_request( ).
     /ui2/cl_json=>deserialize(
       EXPORTING
         json        = lv_body
@@ -699,91 +918,92 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
       CHANGING
         data        = ls_request ).
 
-    DATA(lt_catsrecords_in)  = VALUE tt_bapicats3( ).
-    DATA(lt_extensionin)     = VALUE tt_bapicats7( ).
-    DATA(lt_longtext)        = VALUE tt_bapicats8( ).
-    DATA(lt_catsrecords_out) = VALUE tt_bapicats2( ).
-    DATA(lt_return)          = VALUE tt_bapiret2( ).
+    DATA(ls_response) = VALUE ts_projects_response( ).
 
-    LOOP AT ls_request-records INTO DATA(ls_record).
-      DATA(ls_bapicats3) = VALUE bapicats3( counter        = ls_record-counter
-                                             workdate       = ls_record-workdate
-                                             employeenumber = ls_request-pernr
-                                             catshours      = ls_record-hours
-                                             unit           = ls_record-unit
-                                             wagetype       = ls_record-wagetype
-                                             acttype        = ls_record-acttype
-                                             send_cctr      = ls_record-send_cctr
-                                             shorttext      = ls_record-shorttext
-                                             abs_att_type   = ls_record-attendance_type
-                                             starttime      = time_from_hhmm( ls_record-start_time )
-                                             endtime        = time_from_hhmm( ls_record-end_time )
-                                             longtext       = xsdbool( ls_record-longtext IS NOT INITIAL ) ).
+    IF ls_request-ytr_key IS NOT INITIAL.
+      SELECT project AS prjct, projecn AS rqsnb, task_name AS text, id_ytr AS ytr_key, status AS ytr_status,
+             beg_date AS date_from, end_date AS date_to
+        FROM zytrproj
+        WHERE id_ytr = @ls_request-ytr_key
+        INTO CORRESPONDING FIELDS OF TABLE @ls_response-requests.
 
-      map_receiver_bapicats3( EXPORTING is_receiver  = ls_record-receiver
-                               CHANGING  cs_bapicats3 = ls_bapicats3 ).
+      IF ls_response-requests IS INITIAL.
+        SELECT r~prjct, r~rqsnb, t~rqsnm AS text, r~ytr_key,
+               r~fcbdt AS date_from, r~fcedt AS date_to, r~is_rejected AS rejected
+          FROM zbtproject AS r
+          LEFT JOIN zbtreqspt AS t ON t~prjct = r~prjct
+                                  AND t~rqsnb = r~rqsnb
+                                  AND t~spras = @sy-langu
+          WHERE r~ytr_key = @ls_request-ytr_key
+            AND r~rqsdl   = @space
+          INTO CORRESPONDING FIELDS OF TABLE @ls_response-requests.
+      ENDIF.
 
-      APPEND ls_bapicats3 TO lt_catsrecords_in.
-      DATA(lv_row) = lines( lt_catsrecords_in ).
-      APPEND LINES OF split_longtext( iv_row  = lv_row
-                                      iv_text = ls_record-longtext ) TO lt_longtext.
+      IF ls_response-requests IS INITIAL.
+        ls_response-messages = VALUE #( ( type = 'E' id = 'MCP' number = '005'
+                                          text = |Задача { ls_request-ytr_key } не привязана к проекту и номеру ТЗ| ) ).
+      ENDIF.
+    ELSE.
+      SELECT p~prjct, t~prjct_t AS text
+        FROM zbtprjct AS p
+        LEFT JOIN zbtprjctt AS t ON t~prjct = p~prjct
+                                AND t~spras = @sy-langu
+        WHERE p~active = @abap_true
+        ORDER BY p~prjct
+        INTO TABLE @ls_response-projects.
 
-      APPEND VALUE bapicats7( structure  = 'BAPI_TE_CATSDB'
-                               valuepart1 = to_bapi_te_catsdb( iv_row = lv_row
-                                                                is_ext = ls_record-ext ) )
-             TO lt_extensionin.
-    ENDLOOP.
+      IF ls_request-prjct IS NOT INITIAL.
+        DELETE ls_response-projects WHERE prjct <> ls_request-prjct.
 
-    DATA(lt_limit_return) = check_daily_limit(
-      iv_pernr      = ls_request-pernr
-      it_records    = VALUE #( FOR ls_changed IN ls_request-records
-                               ( workdate = ls_changed-workdate hours = ls_changed-hours ) )
-      iv_norm_hours = ls_request-norm_hours
-      it_exclude    = VALUE #( FOR ls_changed IN ls_request-records ( ls_changed-counter ) ) ).
+        IF ls_response-projects IS INITIAL.
+          ls_response-messages = VALUE #( ( type = 'E' id = 'MCP' number = '004'
+                                            text = |Проект { ls_request-prjct } не найден или не активен| ) ).
+        ELSE.
+          SELECT r~prjct, r~rqsnb, t~rqsnm AS text, r~ytr_key,
+                 r~fcbdt AS date_from, r~fcedt AS date_to, r~is_rejected AS rejected
+            FROM zbtproject AS r
+            LEFT JOIN zbtreqspt AS t ON t~prjct = r~prjct
+                                    AND t~rqsnb = r~rqsnb
+                                    AND t~spras = @sy-langu
+            WHERE r~prjct = @ls_request-prjct
+              AND r~rqsdl = @space
+            INTO CORRESPONDING FIELDS OF TABLE @ls_response-requests.
 
-    CALL FUNCTION 'BAPI_CATIMESHEETMGR_CHANGE'
-      EXPORTING
-        profile         = ls_request-profile
-        testrun         = ls_request-test
-      TABLES
-        catsrecords_in  = lt_catsrecords_in
-        extensionin     = lt_extensionin
-        catsrecords_out = lt_catsrecords_out
-        longtext        = lt_longtext
-        return          = lt_return.
+          DATA(lt_ytr) = VALUE tt_request_row( ).
+          SELECT project AS prjct, projecn AS rqsnb, task_name AS text, id_ytr AS ytr_key, status AS ytr_status,
+                 beg_date AS date_from, end_date AS date_to
+            FROM zytrproj
+            WHERE project = @ls_request-prjct
+              AND status  <> @c_ytr_deleted
+            INTO CORRESPONDING FIELDS OF TABLE @lt_ytr.
 
-    APPEND LINES OF lt_limit_return TO lt_return.
+          LOOP AT lt_ytr INTO DATA(ls_ytr).
+            READ TABLE ls_response-requests WITH KEY rqsnb = ls_ytr-rqsnb ASSIGNING FIELD-SYMBOL(<ls_known>).
+            IF sy-subrc = 0.
+              <ls_known>-ytr_key    = ls_ytr-ytr_key.
+              <ls_known>-ytr_status = ls_ytr-ytr_status.
+            ELSE.
+              APPEND ls_ytr TO ls_response-requests.
+            ENDIF.
+          ENDLOOP.
 
-    DATA(lv_committed) = abap_false.
-
-    IF ls_request-test = abap_false.
-      IF has_errors( lt_return ) = abap_false.
-        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
-          EXPORTING
-            wait = abap_true.
-        lv_committed = abap_true.
-      ELSE.
-        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+          SORT ls_response-requests BY rqsnb.
+        ENDIF.
+      ELSEIF ls_request-search IS NOT INITIAL.
+        DELETE ls_response-projects WHERE NOT ( prjct CS ls_request-search OR text CS ls_request-search ).
       ENDIF.
     ENDIF.
-
-    DATA(lt_changed) = VALUE tt_changed_row(
-      FOR ls_out IN lt_catsrecords_out INDEX INTO lv_idx
-      ( row = lv_idx counter = ls_out-counter workdate = ls_out-workdate status = ls_out-status ) ).
-
-    DATA(ls_response) = VALUE ts_change_response( changed   = lt_changed
-                                                    committed = lv_committed
-                                                    messages  = to_messages( lt_return ) ).
 
     DATA(lv_json) = /ui2/cl_json=>serialize( data        = ls_response
                                               pretty_name = /ui2/cl_json=>pretty_mode-low_case ).
     send_json( server = server code = 200 json = lv_json ).
   ENDMETHOD.
 
-  METHOD route_delete.
+
+  METHOD route_read.
     DATA(lv_body) = read_body( server ).
 
-    DATA(ls_request) = VALUE ts_delete_request( ).
+    DATA(ls_request) = VALUE ts_read_request( ).
     /ui2/cl_json=>deserialize(
       EXPORTING
         json        = lv_body
@@ -791,48 +1011,46 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
       CHANGING
         data        = ls_request ).
 
-    DATA(lt_catsrecords) = VALUE tt_bapicats4( ).
-    DATA(lt_return)       = VALUE tt_bapiret2( ).
+    DATA(lt_rows) = VALUE tt_cats_row( ).
+    DATA(lt_status_range) = VALUE tt_status_range( FOR lv_s IN ls_request-status
+                                                    ( sign = 'I' option = 'EQ' low = lv_s ) ).
 
-    LOOP AT ls_request-counters INTO DATA(lv_counter).
-      APPEND VALUE bapicats4( counter = lv_counter ) TO lt_catsrecords.
-    ENDLOOP.
-
-    CALL FUNCTION 'BAPI_CATIMESHEETMGR_DELETE'
-      EXPORTING
-        testrun     = ls_request-test
-      TABLES
-        catsrecords = lt_catsrecords
-        return      = lt_return.
-
-    DATA(lv_committed) = abap_false.
-
-    IF ls_request-test = abap_false.
-      IF has_errors( lt_return ) = abap_false.
-        CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
-          EXPORTING
-            wait = abap_true.
-        lv_committed = abap_true.
-      ELSE.
-        CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
-      ENDIF.
+    IF ls_request-status IS NOT INITIAL.
+      SELECT counter, workdate, pernr,
+             rkostl AS rec_cctr, raufnr AS rec_order,
+             lstar AS acttype, lgart AS wagetype, meinh AS unit,
+             catshours AS hours, status,
+             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit, longtext
+        FROM catsdb
+        WHERE pernr = @ls_request-pernr
+          AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
+          AND status IN @lt_status_range
+        INTO TABLE @lt_rows.
+    ELSE.
+      SELECT counter, workdate, pernr,
+             rkostl AS rec_cctr, raufnr AS rec_order,
+             lstar AS acttype, lgart AS wagetype, meinh AS unit,
+             catshours AS hours, status,
+             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit, longtext
+        FROM catsdb
+        WHERE pernr = @ls_request-pernr
+          AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
+        INTO TABLE @lt_rows.
     ENDIF.
 
-    DATA(lt_deleted) = VALUE tt_deleted_row( ).
-    IF lv_committed = abap_true.
-      lt_deleted = VALUE tt_deleted_row(
-        FOR lv_c IN ls_request-counters INDEX INTO lv_idx
-        ( row = lv_idx counter = lv_c ) ).
-    ENDIF.
+    DATA(lv_total) = REDUCE catshours( INIT sum TYPE catshours
+                                        FOR row IN lt_rows WHERE ( status <> c_status_cancelled )
+                                        NEXT sum = sum + row-hours ).
 
-    DATA(ls_response) = VALUE ts_delete_response( deleted   = lt_deleted
-                                                    committed = lv_committed
-                                                    messages  = to_messages( lt_return ) ).
+    DATA(ls_response) = VALUE ts_read_response( rows        = lt_rows
+                                                  total_hours = lv_total
+                                                  messages    = VALUE #( ) ).
 
     DATA(lv_json) = /ui2/cl_json=>serialize( data        = ls_response
                                               pretty_name = /ui2/cl_json=>pretty_mode-low_case ).
     send_json( server = server code = 200 json = lv_json ).
   ENDMETHOD.
+
 
   METHOD route_release.
     DATA(lv_body) = read_body( server ).
@@ -855,7 +1073,7 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
              skostl AS send_cctr, rkostl AS rec_cctr, kokrs AS co_area, raufnr AS rec_order,
              rkdauf AS sales_ord, rkdpos AS sales_item, sebeln AS po_number, sebelp AS po_item,
              ltxa1 AS shorttext, awart AS att_type, beguz AS start_time, enduz AS end_time,
-             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit
+             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit, longtext
         FROM catsdb
         WHERE counter IN @lt_counter_range
           AND status = '10'
@@ -866,7 +1084,7 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
              skostl AS send_cctr, rkostl AS rec_cctr, kokrs AS co_area, raufnr AS rec_order,
              rkdauf AS sales_ord, rkdpos AS sales_item, sebeln AS po_number, sebelp AS po_item,
              ltxa1 AS shorttext, awart AS att_type, beguz AS start_time, enduz AS end_time,
-             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit
+             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit, longtext
         FROM catsdb
         WHERE pernr = @ls_request-pernr
           AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
@@ -876,6 +1094,7 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
 
     DATA(lt_catsrecords_in)  = VALUE tt_bapicats3( ).
     DATA(lt_extensionin)     = VALUE tt_bapicats7( ).
+    DATA(lt_longtext)        = VALUE tt_bapicats8( ).
     DATA(lt_catsrecords_out) = VALUE tt_bapicats2( ).
     DATA(lt_return)          = VALUE tt_bapiret2( ).
 
@@ -898,11 +1117,18 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
                               shorttext      = ls_row-shorttext
                               abs_att_type   = ls_row-att_type
                               starttime      = ls_row-start_time
-                              endtime        = ls_row-end_time )
+                              endtime        = ls_row-end_time
+                              longtext       = ls_row-longtext )
              TO lt_catsrecords_in.
+      DATA(lv_row) = lines( lt_catsrecords_in ).
+
+      IF ls_row-longtext = abap_true.
+        APPEND LINES OF read_longtext( iv_row     = lv_row
+                                       iv_counter = ls_row-counter ) TO lt_longtext.
+      ENDIF.
 
       APPEND VALUE bapicats7( structure  = 'BAPI_TE_CATSDB'
-                               valuepart1 = to_bapi_te_catsdb( iv_row = sy-tabix
+                               valuepart1 = to_bapi_te_catsdb( iv_row = lv_row
                                                                 is_ext = VALUE ts_ext( rqsnb   = ls_row-rqsnb
                                                                                        prjct   = ls_row-prjct
                                                                                        descr   = ls_row-descr
@@ -913,10 +1139,12 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
     CALL FUNCTION 'BAPI_CATIMESHEETMGR_CHANGE'
       EXPORTING
         release_data    = abap_true
+        text_format_imp = c_text_format
       TABLES
         catsrecords_in  = lt_catsrecords_in
         extensionin     = lt_extensionin
         catsrecords_out = lt_catsrecords_out
+        longtext        = lt_longtext
         return          = lt_return.
 
     DATA(lv_committed) = abap_false.
@@ -945,10 +1173,16 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
     send_json( server = server code = 200 json = lv_json ).
   ENDMETHOD.
 
-  METHOD route_capacity.
+
+  METHOD route_stub.
+    send_error( server = server code = 501 message = |Маршрут { route } ещё не реализован| ).
+  ENDMETHOD.
+
+
+  METHOD route_validate.
     DATA(lv_body) = read_body( server ).
 
-    DATA(ls_request) = VALUE ts_capacity_request( norm_hours = '8' ).
+    DATA(ls_request) = VALUE ts_validate_request( norm_hours = '8' ).
     /ui2/cl_json=>deserialize(
       EXPORTING
         json        = lv_body
@@ -956,195 +1190,62 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
       CHANGING
         data        = ls_request ).
 
-    DATA(lt_booked) = VALUE tt_booked_day( ).
-    SELECT workdate, SUM( catshours ) AS hours
-      FROM catsdb
-      WHERE pernr = @ls_request-pernr
-        AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
-        AND status <> @c_status_cancelled
-      GROUP BY workdate
-      INTO TABLE @lt_booked.
+    DATA(lt_catsrecords_in) = VALUE tt_bapicats1( ).
+    DATA(lt_extensionin)    = VALUE tt_bapicats7( ).
+    DATA(lt_longtext)       = VALUE tt_bapicats8( ).
+    DATA(lt_return)         = VALUE tt_bapiret2( ).
 
-    DATA(lt_days)       = VALUE tt_capacity_day( ).
-    DATA(lv_total_free) = VALUE catsdb-catshours( ).
-    DATA(lv_date)       = ls_request-date_from.
+    LOOP AT ls_request-records INTO DATA(ls_record).
+      DATA(ls_bapicats1) = VALUE bapicats1( workdate       = ls_record-workdate
+                                             employeenumber = ls_request-pernr
+                                             catshours      = ls_record-hours
+                                             unit           = ls_record-unit
+                                             wagetype       = ls_record-wagetype
+                                             acttype        = ls_record-acttype
+                                             send_cctr      = ls_record-send_cctr
+                                             shorttext      = ls_record-shorttext
+                                             abs_att_type   = ls_record-attendance_type
+                                             starttime      = time_from_hhmm( ls_record-start_time )
+                                             endtime        = time_from_hhmm( ls_record-end_time )
+                                             longtext       = xsdbool( ls_record-longtext IS NOT INITIAL ) ).
 
-    WHILE lv_date <= ls_request-date_to.
-      DATA(lv_flag) = VALUE scal-indicator( ).
-      CALL FUNCTION 'DATE_CONVERT_TO_FACTORYDATE'
-        EXPORTING
-          date                 = lv_date
-          factory_calendar_id  = c_calendar
-        IMPORTING
-          workingday_indicator = lv_flag
-        EXCEPTIONS
-          date_invalid               = 1
-          date_before_range          = 2
-          date_after_range           = 3
-          factory_calendar_not_found = 4
-          OTHERS                     = 5.
+      map_receiver( EXPORTING is_receiver  = ls_record-receiver
+                    CHANGING  cs_bapicats1 = ls_bapicats1 ).
 
-      DATA(lv_is_workday) = xsdbool( sy-subrc = 0 AND lv_flag = space ).
-      DATA(lv_booked)     = VALUE catsdb-catshours( lt_booked[ workdate = lv_date ]-hours OPTIONAL ).
-      DATA(lv_norm)       = COND catsdb-catshours( WHEN lv_is_workday = abap_true THEN ls_request-norm_hours ELSE 0 ).
-      DATA(lv_free)       = lv_norm - lv_booked.
+      APPEND ls_bapicats1 TO lt_catsrecords_in.
+      DATA(lv_row) = lines( lt_catsrecords_in ).
+      APPEND LINES OF split_longtext( iv_row  = lv_row
+                                      iv_text = ls_record-longtext ) TO lt_longtext.
 
-      APPEND VALUE ts_capacity_day( date       = lv_date
-                                     is_workday = lv_is_workday
-                                     booked     = lv_booked
-                                     free       = lv_free )
-             TO lt_days.
+      APPEND VALUE bapicats7( structure  = 'BAPI_TE_CATSDB'
+                               valuepart1 = to_bapi_te_catsdb( iv_row = lv_row
+                                                                is_ext = ls_record-ext ) )
+             TO lt_extensionin.
+    ENDLOOP.
 
-      lv_total_free = lv_total_free + lv_free.
-      lv_date       = lv_date + 1.
-    ENDWHILE.
+    DATA(lt_limit_return) = check_daily_limit( iv_pernr      = ls_request-pernr
+                                                it_records    = ls_request-records
+                                                iv_norm_hours = ls_request-norm_hours ).
 
-    DATA(ls_response) = VALUE ts_capacity_response( days       = lt_days
-                                                      norm_hours = ls_request-norm_hours
-                                                      calendar   = c_calendar
-                                                      total_free = lv_total_free ).
+    CALL FUNCTION 'BAPI_CATIMESHEETMGR_INSERT'
+      EXPORTING
+        profile        = ls_request-profile
+        testrun        = abap_true
+      TABLES
+        catsrecords_in = lt_catsrecords_in
+        extensionin    = lt_extensionin
+        longtext       = lt_longtext
+        return         = lt_return.
+
+    APPEND LINES OF lt_limit_return TO lt_return.
+
+    DATA(ls_response) = VALUE ts_validate_response( messages = to_messages( lt_return ) ).
 
     DATA(lv_json) = /ui2/cl_json=>serialize( data        = ls_response
                                               pretty_name = /ui2/cl_json=>pretty_mode-low_case ).
     send_json( server = server code = 200 json = lv_json ).
   ENDMETHOD.
 
-  METHOD map_receiver.
-    IF is_receiver-order IS NOT INITIAL.
-      cs_bapicats1-rec_order = is_receiver-order.
-    ELSEIF is_receiver-cost_center IS NOT INITIAL.
-      cs_bapicats1-rec_cctr = is_receiver-cost_center.
-      cs_bapicats1-co_area  = is_receiver-co_area.
-    ELSEIF is_receiver-wbs IS NOT INITIAL.
-      cs_bapicats1-wbs_element = is_receiver-wbs.
-    ELSEIF is_receiver-network IS NOT INITIAL.
-      cs_bapicats1-network      = is_receiver-network.
-      cs_bapicats1-activity     = is_receiver-activity.
-      cs_bapicats1-sub_activity = is_receiver-sub_activity.
-    ELSEIF is_receiver-sales_order IS NOT INITIAL.
-      cs_bapicats1-recsaleord = is_receiver-sales_order.
-      cs_bapicats1-recitem    = is_receiver-item.
-    ELSEIF is_receiver-purchase_order IS NOT INITIAL.
-      cs_bapicats1-po_number = is_receiver-purchase_order.
-      cs_bapicats1-po_item   = is_receiver-item.
-    ENDIF.
-  ENDMETHOD.
-
-  METHOD map_receiver_bapicats3.
-    IF is_receiver-order IS NOT INITIAL.
-      cs_bapicats3-rec_order = is_receiver-order.
-    ELSEIF is_receiver-cost_center IS NOT INITIAL.
-      cs_bapicats3-rec_cctr = is_receiver-cost_center.
-      cs_bapicats3-co_area  = is_receiver-co_area.
-    ELSEIF is_receiver-wbs IS NOT INITIAL.
-      cs_bapicats3-wbs_element = is_receiver-wbs.
-    ELSEIF is_receiver-network IS NOT INITIAL.
-      cs_bapicats3-network      = is_receiver-network.
-      cs_bapicats3-activity     = is_receiver-activity.
-      cs_bapicats3-sub_activity = is_receiver-sub_activity.
-    ELSEIF is_receiver-sales_order IS NOT INITIAL.
-      cs_bapicats3-recsaleord = is_receiver-sales_order.
-      cs_bapicats3-recitem    = is_receiver-item.
-    ELSEIF is_receiver-purchase_order IS NOT INITIAL.
-      cs_bapicats3-po_number = is_receiver-purchase_order.
-      cs_bapicats3-po_item   = is_receiver-item.
-    ENDIF.
-  ENDMETHOD.
-
-  METHOD time_from_hhmm.
-    IF strlen( iv_hhmm ) <> 5.
-      RETURN.
-    ENDIF.
-    rv_tims = iv_hhmm(2) && iv_hhmm+3(2) && '00'.
-  ENDMETHOD.
-
-  METHOD to_bapi_te_catsdb.
-    DATA(ls_custom) = VALUE bapi_te_catsdb( row       = iv_row
-                                             zzprjct   = is_ext-prjct
-                                             zzrqsnb   = is_ext-rqsnb
-                                             zzdescr   = is_ext-descr
-                                             zzorgunit = is_ext-orgunit ).
-    rv_value = ls_custom.
-  ENDMETHOD.
-
-  METHOD to_messages.
-    rt_messages = VALUE #( FOR ls_return IN it_return
-                            ( type   = ls_return-type
-                              id     = ls_return-id
-                              number = ls_return-number
-                              text   = ls_return-message
-                              row    = ls_return-row ) ).
-  ENDMETHOD.
-
-  METHOD has_errors.
-    rv_result = xsdbool( line_exists( it_return[ type = 'E' ] ) OR line_exists( it_return[ type = 'A' ] ) ).
-  ENDMETHOD.
-
-  METHOD check_daily_limit.
-    CHECK it_records IS NOT INITIAL.
-
-    DATA(lt_new_by_day) = VALUE tt_booked_day( ).
-    LOOP AT it_records INTO DATA(ls_record).
-      READ TABLE lt_new_by_day WITH KEY workdate = ls_record-workdate ASSIGNING FIELD-SYMBOL(<ls_new_day>).
-      IF sy-subrc = 0.
-        <ls_new_day>-hours = <ls_new_day>-hours + ls_record-hours.
-      ELSE.
-        APPEND VALUE ts_booked_day( workdate = ls_record-workdate hours = ls_record-hours ) TO lt_new_by_day.
-      ENDIF.
-    ENDLOOP.
-
-    DATA(lt_date_range) = VALUE tt_workdate_range( FOR ls_range_day IN lt_new_by_day
-                                                    ( sign = 'I' option = 'EQ' low = ls_range_day-workdate ) ).
-
-    DATA(lt_rows) = VALUE tt_hours_row( ).
-    SELECT counter, workdate, catshours AS hours
-      FROM catsdb
-      WHERE pernr = @iv_pernr
-        AND workdate IN @lt_date_range
-        AND status <> @c_status_cancelled
-      INTO TABLE @lt_rows.
-
-    LOOP AT lt_new_by_day INTO DATA(ls_new_day).
-      DATA(lv_existing) = REDUCE catsdb-catshours( INIT sum TYPE catsdb-catshours
-                                                    FOR ls_row IN lt_rows WHERE ( workdate = ls_new_day-workdate )
-                                                    NEXT sum = sum + COND catsdb-catshours( WHEN line_exists( it_exclude[ table_line = ls_row-counter ] )
-                                                                                            THEN 0
-                                                                                            ELSE ls_row-hours ) ).
-      DATA(lv_total)    = lv_existing + ls_new_day-hours.
-
-      IF lv_total > iv_norm_hours.
-        APPEND VALUE bapiret2( type    = 'E'
-                                id      = 'MCP'
-                                number  = '002'
-                                message = |Превышена дневная норма { iv_norm_hours DECIMALS = 2 } ч на { ls_new_day-workdate DATE = ISO }: | &&
-                                          |уже { lv_existing DECIMALS = 2 } + новые { ls_new_day-hours DECIMALS = 2 } = { lv_total DECIMALS = 2 }| )
-               TO rt_return.
-      ENDIF.
-    ENDLOOP.
-  ENDMETHOD.
-
-  METHOD split_longtext.
-    CHECK iv_text IS NOT INITIAL.
-
-    SPLIT iv_text AT cl_abap_char_utilities=>newline INTO TABLE DATA(lt_paragraphs).
-
-    LOOP AT lt_paragraphs INTO DATA(lv_paragraph).
-      DATA(lv_rest)   = replace( val = lv_paragraph sub = |\r| with = `` occ = 0 ).
-      DATA(lv_format) = CONV bapicats8-format_col( '*' ).
-      DO.
-        DATA(lv_len) = nmin( val1 = strlen( lv_rest ) val2 = 132 ).
-        APPEND VALUE bapicats8( row        = iv_row
-                                format_col = lv_format
-                                text_line  = substring( val = lv_rest len = lv_len ) )
-               TO rt_lines.
-        lv_rest   = substring( val = lv_rest off = lv_len ).
-        lv_format = '='.
-        IF lv_rest IS INITIAL.
-          EXIT.
-        ENDIF.
-      ENDDO.
-    ENDLOOP.
-  ENDMETHOD.
 
   METHOD route_whoami.
     DATA(ls_response) = VALUE ts_whoami_response( user = sy-uname ).
@@ -1182,51 +1283,68 @@ CLASS zcl_cats_mcp_handler IMPLEMENTATION.
     send_json( server = server code = 200 json = lv_json ).
   ENDMETHOD.
 
-  METHOD route_projects.
-    DATA(lv_body) = read_body( server ).
 
-    DATA(ls_request) = VALUE ts_projects_request( ).
-    /ui2/cl_json=>deserialize(
-      EXPORTING
-        json        = lv_body
-        pretty_name = /ui2/cl_json=>pretty_mode-low_case
-      CHANGING
-        data        = ls_request ).
-
-    DATA(ls_response) = VALUE ts_projects_response( ).
-
-    SELECT p~prjct, t~prjct_t AS text
-      FROM zbtprjct AS p
-      LEFT JOIN zbtprjctt AS t ON t~prjct = p~prjct
-                              AND t~spras = @sy-langu
-      WHERE p~active = @abap_true
-      ORDER BY p~prjct
-      INTO TABLE @ls_response-projects.
-
-    IF ls_request-prjct IS NOT INITIAL.
-      DELETE ls_response-projects WHERE prjct <> ls_request-prjct.
-
-      IF ls_response-projects IS INITIAL.
-        ls_response-messages = VALUE #( ( type = 'E' id = 'MCP' number = '004'
-                                          text = |Проект { ls_request-prjct } не найден или не активен| ) ).
-      ELSE.
-        SELECT r~rqsnb, t~rqsnm AS text, r~fcbdt AS date_from, r~fcedt AS date_to, r~is_rejected AS rejected
-          FROM zbtproject AS r
-          LEFT JOIN zbtreqspt AS t ON t~prjct = r~prjct
-                                  AND t~rqsnb = r~rqsnb
-                                  AND t~spras = @sy-langu
-          WHERE r~prjct = @ls_request-prjct
-            AND r~rqsdl = @space
-          ORDER BY r~rqsnb
-          INTO TABLE @ls_response-requests.
-      ENDIF.
-    ELSEIF ls_request-search IS NOT INITIAL.
-      DELETE ls_response-projects WHERE NOT ( prjct CS ls_request-search OR text CS ls_request-search ).
-    ENDIF.
-
-    DATA(lv_json) = /ui2/cl_json=>serialize( data        = ls_response
-                                              pretty_name = /ui2/cl_json=>pretty_mode-low_case ).
-    send_json( server = server code = 200 json = lv_json ).
+  METHOD send_error.
+    DATA(lv_json) = |\{"messages":[\{"type":"E","id":"MCP","number":"000","text":"{ message }"\}]\}|.
+    send_json( server = server code = code json = lv_json ).
   ENDMETHOD.
 
+
+  METHOD send_json.
+    server->response->set_status( code = code reason = '' ).
+    server->response->set_header_field( name = 'content-type' value = 'application/json; charset=utf-8' ).
+    server->response->set_cdata( data = json ).
+  ENDMETHOD.
+
+
+  METHOD split_longtext.
+    CHECK iv_text IS NOT INITIAL.
+
+    SPLIT iv_text AT cl_abap_char_utilities=>newline INTO TABLE DATA(lt_paragraphs).
+
+    LOOP AT lt_paragraphs INTO DATA(lv_paragraph).
+      DATA(lv_rest)   = replace( val = lv_paragraph sub = |\r| with = `` occ = 0 ).
+      DATA(lv_format) = CONV bapicats8-format_col( '*' ).
+      DO.
+        DATA(lv_len) = nmin( val1 = strlen( lv_rest ) val2 = 132 ).
+        APPEND VALUE bapicats8( row        = iv_row
+                                format_col = lv_format
+                                text_line  = substring( val = lv_rest len = lv_len ) )
+               TO rt_lines.
+        lv_rest   = substring( val = lv_rest off = lv_len ).
+        lv_format = '='.
+        IF lv_rest IS INITIAL.
+          EXIT.
+        ENDIF.
+      ENDDO.
+    ENDLOOP.
+  ENDMETHOD.
+
+
+  METHOD time_from_hhmm.
+    IF strlen( iv_hhmm ) <> 5.
+      RETURN.
+    ENDIF.
+    rv_tims = iv_hhmm(2) && iv_hhmm+3(2) && '00'.
+  ENDMETHOD.
+
+
+  METHOD to_bapi_te_catsdb.
+    DATA(ls_custom) = VALUE bapi_te_catsdb( row       = iv_row
+                                             zzprjct   = is_ext-prjct
+                                             zzrqsnb   = is_ext-rqsnb
+                                             zzdescr   = is_ext-descr
+                                             zzorgunit = is_ext-orgunit ).
+    rv_value = ls_custom.
+  ENDMETHOD.
+
+
+  METHOD to_messages.
+    rt_messages = VALUE #( FOR ls_return IN it_return
+                            ( type   = ls_return-type
+                              id     = ls_return-id
+                              number = ls_return-number
+                              text   = ls_return-message
+                              row    = ls_return-row ) ).
+  ENDMETHOD.
 ENDCLASS.

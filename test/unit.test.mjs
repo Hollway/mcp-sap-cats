@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { catsRecord, receiver } from "../dist/schemas.js";
 import { SapClient, SapError, formatMessages, hasErrors, isLocked } from "../dist/sap.js";
 
-const baseRecord = { workdate: "2026-09-21", hours: 2, ext: { prjct: "PRJ01" } };
+const baseRecord = { workdate: "2026-09-21", hours: 2, ext: { prjct: "PRJ01", descr: "Работа" } };
 
 test("catsRecord: минимальная запись без receiver проходит и получает умолчания", () => {
   const parsed = catsRecord.parse(baseRecord);
@@ -12,8 +12,10 @@ test("catsRecord: минимальная запись без receiver прохо
   assert.equal(parsed.receiver, undefined);
 });
 
-test("catsRecord: ext.prjct обязателен (BAdI ZCL_BADI_CATS)", () => {
-  assert.equal(catsRecord.safeParse({ ...baseRecord, ext: {} }).success, false);
+test("catsRecord: нужен ext.prjct или ext.ytr_key (ZCATS001)", () => {
+  assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { descr: "Работа" } }).success, false);
+  assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { ytr_key: "SAP-19109" } }).success, true);
+  assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { ytr_key: "sap 19109" } }).success, false);
   assert.equal(catsRecord.safeParse({ workdate: "2026-09-21", hours: 2 }).success, false);
 });
 
@@ -35,9 +37,14 @@ test("catsRecord: longtext необязателен и ограничен 4000 �
   assert.equal(catsRecord.safeParse({ ...baseRecord, longtext: "x".repeat(4001) }).success, false);
 });
 
+test("catsRecord: без номера ТЗ описание обязательно, с номером — нет", () => {
+  assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { prjct: "PRJ01" } }).success, false);
+  assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { prjct: "PRJ01", rqsnb: "562" } }).success, true);
+});
+
 test("catsRecord: неизвестные поля отвергаются", () => {
   assert.equal(catsRecord.safeParse({ ...baseRecord, counter: "1" }).success, false);
-  assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { prjct: "PRJ01", zzfoo: "x" } }).success, false);
+  assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { prjct: "PRJ01", descr: "Работа", zzfoo: "x" } }).success, false);
 });
 
 test("receiver: ровно один вид объекта отнесения", () => {
