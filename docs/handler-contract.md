@@ -31,11 +31,13 @@ Node-сторона написана против этого контракта,
 | POST | `/delete` | `BAPI_CATIMESHEETMGR_DELETE` | то же |
 | POST | `/release` | `BAPI_CATIMESHEETMGR_CHANGE`, `RELEASE_DATA = 'X'`, ресенд строки из `CATSDB` | то же |
 | POST | `/whoami` | `PA0105` (подтип `0001`) по `sy-uname`, `PA0001`, `T527X` | — |
-| POST | `/projects` | `ZBTPRJCT`/`ZBTPRJCTT`, с `prjct` — `ZBTPROJECT`/`ZBTREQSPT` | — |
+| POST | `/projects` | `ZBTPRJCT`/`ZBTPRJCTT`; с `prjct` — ТЗ из `ZBTPROJECT`/`ZBTREQSPT` и `ZYTRPROJ`; с `ytr_key` — пара из `ZYTRPROJ`, затем `ZBTPROJECT` | — |
 
 Дневной лимит, `/capacity` и `total_hours` в `/read` не учитывают сторнированные записи (статус `60`): они сохраняют часы в `CATSDB`.
 
-Подробный текст записи — поле `longtext` (строка с переводами строк) в `records` маршрутов `/validate`, `/insert`, `/change`; уходит в параметр `LONGTEXT` BAPI (`BAPICATS8`, по 132 символа). `/read` возвращает только признак `longtext`.
+Подробный текст записи — поле `longtext` (строка с переводами строк) в `records` маршрутов `/validate`, `/insert`, `/change`; уходит в параметр `LONGTEXT` BAPI (`BAPICATS8`, по 132 символа). `/read` возвращает только признак `longtext`. `/change` и `/release` передают `TEXT_FORMAT_IMP = 'ITF'`; `/release` пересылает существующий подробный текст, иначе BAPI его удалит.
+
+`ext.ytr_key` (ключ задачи Трекера) хендлеру не передаётся: MCP заранее переводит его в `prjct` + `rqsnb` через `/projects`. Описание (`ext.descr`) при заданном номере ТЗ можно не передавать — его подставит пользовательский выход CATS `ZXCATU02`.
 
 **Фиксация обязана происходить внутри того же обращения к хендлеру, что и вызов BAPI.** При stateless HTTP каждый запрос — новая LUW, и запись пропадёт молча.
 

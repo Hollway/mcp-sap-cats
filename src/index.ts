@@ -9,6 +9,8 @@ import {
   pernr,
   profile,
   CATS_STATUS,
+  CATS_YTR_STATUS,
+  ytrKey,
 } from "./schemas.js";
 import { BapiMessage, SapClient, SapError, formatMessages, hasErrors, loadConfig } from "./sap.js";
 
@@ -21,6 +23,56 @@ const ok = (payload: unknown, messages: BapiMessage[] = []) => {
   const text = [JSON.stringify(payload, null, 2), formatMessages(messages)].filter(Boolean).join("\n\n");
   return { content: [{ type: "text" as const, text }] };
 };
+
+const pernrText = (value: unknown) => String(value ?? "").padStart(8, "0");
+
+interface ProjectRequest {
+  prjct: string;
+  rqsnb: number | string;
+  text: string;
+  ytr_key: string;
+  ytr_status: string;
+}
+
+type Ext = { prjct?: string; rqsnb?: string; ytr_key?: string };
+
+/**
+ * ext.ytr_key → prjct + rqsnb. Ключ ищется хендлером сначала в ZYTRPROJ,
+ * потом в ZBTPROJECT; у нескольких старых ключей пара не одна — тогда
+ * пусть пользователь укажет её явно, угадывать нельзя.
+ */
+async function resolveYtrKeys<R extends { ext: Ext }>(records: R[]): Promise<R[]> {
+  const pairs = new Map<string, { prjct: string; rqsnb: string }>();
+  const resolved: R[] = [];
+  for (const [index, record] of records.entries()) {
+    const { ytr_key: key, ...ext } = record.ext;
+    if (!key) {
+      resolved.push(record);
+      continue;
+    }
+    let pair = pairs.get(key);
+    if (!pair) {
+      const data = await sap.call<{ requests: ProjectRequest[] }>("/projects", "POST", { ytr_key: key });
+      const alive = data.requests.filter((r) => r.ytr_status !== "7");
+      const where = `строка ${index + 1}: задача ${key}`;
+      if (data.requests.length === 0) throw new SapError(`${where} не привязана к проекту и номеру ТЗ`);
+      if (alive.length === 0) throw new SapError(`${where} удалена в Трекере`);
+      if (alive.length > 1) {
+        const list = alive.map((r) => `${r.prjct}/${r.rqsnb}`).join(", ");
+        throw new SapError(`${where} привязана к нескольким парам (${list}) — укажите ext.prjct и ext.rqsnb явно`);
+      }
+      pair = { prjct: alive[0]!.prjct, rqsnb: String(alive[0]!.rqsnb) };
+      pairs.set(key, pair);
+    }
+    if ((ext.prjct && ext.prjct !== pair.prjct) || (ext.rqsnb && Number(ext.rqsnb) !== Number(pair.rqsnb))) {
+      throw new SapError(
+        `строка ${index + 1}: задача ${key} — это ${pair.prjct}/${pair.rqsnb}, а в записи указано ${ext.prjct ?? "—"}/${ext.rqsnb ?? "—"}`,
+      );
+    }
+    resolved.push({ ...record, ext: { ...ext, prjct: pair.prjct, rqsnb: pair.rqsnb } });
+  }
+  return resolved;
+}
 
 const fail = (error: unknown) => {
   const text = error instanceof SapError
@@ -39,8 +91,8 @@ server.registerTool(
   },
   async () => {
     try {
-      const data = await sap.call<{ messages: BapiMessage[] }>("/whoami", "POST", {});
-      const { messages, ...rest } = data;
+      const data = await sap.call<{ pernr: unknown; orgeh: unknown; messages: BapiMessage[] }>("/whoami", "POST", {});
+      const { messages, ...rest } = { ...data, pernr: pernrText(data.pernr), orgeh: String(data.orgeh ?? "") };
       return hasErrors(messages) ? { ...ok(rest, messages), isError: true } : ok(rest, messages);
     } catch (error) {
       return fail(error);
@@ -53,17 +105,37 @@ server.registerTool(
   {
     title: "Активные проекты и номера ТЗ",
     description:
-      "Справочник для ext.prjct и ext.rqsnb. Без параметров — все активные проекты; search — фильтр по коду или названию; prjct — номера ТЗ этого проекта (без удалённых).",
+      "Справочник для ext.prjct, ext.rqsnb и ext.ytr_key. Без параметров — активные проекты; search — фильтр (по проектам, а вместе с prjct — по номерам и названиям ТЗ); prjct — номера ТЗ проекта из обоих источников (старый график разработок и задачи Трекера) с ключом и статусом задачи; ytr_key — пара проект + номер ТЗ для задачи Трекера. Новые ТЗ идут первыми, выдача ограничена limit.",
     inputSchema: {
-      search: z.string().max(50).optional().describe("Часть кода или названия проекта, без учёта регистра"),
+      search: z.string().max(70).optional().describe("Часть кода/названия проекта или, вместе с prjct, номера/названия ТЗ; без учёта регистра"),
       prjct: z.string().max(30).optional().describe("Код проекта — вернуть его номера ТЗ"),
+      ytr_key: ytrKey.optional().describe("Ключ задачи в Трекере — вернуть её проект и номер ТЗ"),
+      limit: z.number().int().positive().max(500).default(50).describe("Сколько строк вернуть"),
     },
   },
-  async (args) => {
+  async ({ limit, ...args }) => {
     try {
-      const data = await sap.call<{ messages: BapiMessage[] }>("/projects", "POST", args);
-      const { messages, ...rest } = data;
-      return ok(rest, messages);
+      const data = await sap.call<{ projects: unknown[]; requests: ProjectRequest[]; messages: BapiMessage[] }>(
+        "/projects",
+        "POST",
+        args,
+      );
+      const needle = args.prjct && args.search ? args.search.toLowerCase() : "";
+      const requests = data.requests
+        .filter((r) => !needle || `${r.rqsnb} ${r.text} ${r.ytr_key}`.toLowerCase().includes(needle))
+        .sort((a, b) => Number(b.rqsnb) - Number(a.rqsnb))
+        .map((r) => ({
+          ...r,
+          rqsnb: String(r.rqsnb),
+          ...(r.ytr_status ? { ytr_status_text: CATS_YTR_STATUS[r.ytr_status] ?? r.ytr_status } : {}),
+        }));
+      const payload = {
+        projects: data.projects.slice(0, limit),
+        projects_total: data.projects.length,
+        requests: requests.slice(0, limit),
+        requests_total: requests.length,
+      };
+      return hasErrors(data.messages) ? { ...ok(payload, data.messages), isError: true } : ok(payload, data.messages);
     } catch (error) {
       return fail(error);
     }
@@ -85,12 +157,17 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const data = await sap.call<{ rows: Array<{ status: string }>; total_hours: number }>(
+      const data = await sap.call<{ rows: Array<{ status: string; pernr: unknown; rqsnb: unknown }>; total_hours: number }>(
         "/read",
         "POST",
         args,
       );
-      const rows = data.rows.map((r) => ({ ...r, status_text: CATS_STATUS[r.status] ?? r.status }));
+      const rows = data.rows.map((r) => ({
+        ...r,
+        pernr: pernrText(r.pernr),
+        rqsnb: r.rqsnb ? String(r.rqsnb) : "",
+        status_text: CATS_STATUS[r.status] ?? r.status,
+      }));
       return ok({ ...data, rows });
     } catch (error) {
       return fail(error);
@@ -134,7 +211,8 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const data = await sap.call<{ messages: BapiMessage[] }>("/validate", "POST", args);
+      const records = await resolveYtrKeys(args.records);
+      const data = await sap.call<{ messages: BapiMessage[] }>("/validate", "POST", { ...args, records });
       return ok({ ok: !hasErrors(data.messages) }, data.messages);
     } catch (error) {
       return fail(error);
@@ -163,10 +241,11 @@ server.registerTool(
   },
   async (args) => {
     try {
+      const records = await resolveYtrKeys(args.records);
       const data = await sap.call<{ created: unknown[]; committed: boolean; messages: BapiMessage[] }>(
         "/insert",
         "POST",
-        args,
+        { ...args, records },
       );
       return ok({ created: data.created, committed: data.committed }, data.messages);
     } catch (error) {
@@ -191,10 +270,11 @@ server.registerTool(
   },
   async (args) => {
     try {
+      const records = await resolveYtrKeys(args.records);
       const data = await sap.call<{ changed: unknown[]; committed: boolean; messages: BapiMessage[] }>(
         "/change",
         "POST",
-        args,
+        { ...args, records },
       );
       return ok({ changed: data.changed, committed: data.committed }, data.messages);
     } catch (error) {
@@ -257,7 +337,8 @@ const prompt = (text: string) => ({ messages: [{ role: "user" as const, content:
 
 const WRITE_RULES = `Правила записи:
 - ничего не записывай, пока я не подтвердил итоговую таблицу (дата, часы, проект, номер ТЗ, текст);
-- код проекта и номер ТЗ бери из cats_projects, не придумывай;
+- код проекта и номер ТЗ бери из cats_projects, не придумывай; если известен ключ задачи в Трекере (SAP-…), передай его в ext.ytr_key вместо пары;
+- с номером ТЗ описание не передавай — SAP подставит название ТЗ сам; без номера ТЗ описание обязательно;
 - перед записью прогони cats_validate и покажи сообщения, если они есть;
 - один вызов cats_insert на весь набор, idempotency_key — 8–20 символов, уникальный для этого набора, при повторе после сбоя используй тот же ключ;
 - после записи покажи результат через cats_read.`;

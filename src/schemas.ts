@@ -39,19 +39,49 @@ export const receiver = z.union([
   z.object({ purchase_order: z.string().max(10), item: z.string().max(5) }).strict(),
 ]);
 
+export const CATS_YTR_STATUS: Record<string, string> = {
+  "0": "Новый документ",
+  "1": "Опубликовано",
+  "2": "Передано в работу",
+  "3": "В работе",
+  "4": "Тестирование",
+  "5": "Выполнено",
+  "6": "На согласовании",
+  "7": "Удалено",
+  "9": "В продуктиве",
+};
+
+export const ytrKey = z
+  .string()
+  .regex(/^[A-Z][A-Z0-9]*-\d+$/)
+  .describe("Ключ задачи в Яндекс Трекере, например SAP-19109");
+
 /**
  * Z-поля CATSDB, уходят в EXTENSIONIN через структуру BAPI_TE_CATSDB.
- * prjct обязателен: BAdI ZCL_BADI_CATS отбраковывает всю запись без
- * активного проекта (ZCATS001, проверено TESTRUN).
+ * Проект обязателен: пользовательский выход ZXCATU05 отбраковывает запись
+ * без активного проекта (ZCATS001). Вместо пары проект + номер ТЗ можно
+ * передать ytr_key — MCP сам найдёт пару до вызова SAP.
+ *
+ * Описание при заданном номере ТЗ подставляет выход ZXCATU02 (как в CAT2),
+ * без номера ТЗ его вводят вручную — поэтому тогда оно обязательно.
  */
 export const extFields = z
   .object({
     rqsnb: z.string().regex(/^\d{1,5}$/).optional().describe("Номер ТЗ"),
-    prjct: z.string().max(30).describe("Проект — обязателен, проверяется BAdI по ZBTPRJCT"),
-    descr: z.string().max(35).optional().describe("Описание"),
-    orgunit: z.string().max(35).optional().describe("Оргединица"),
+    prjct: z.string().max(30).optional().describe("Проект; можно не указывать, если задан ytr_key"),
+    ytr_key: ytrKey.optional().describe("Ключ задачи в Трекере вместо пары prjct + rqsnb"),
+    descr: z
+      .string()
+      .max(35)
+      .optional()
+      .describe("Описание работ; при заданном номере ТЗ подставится из названия ТЗ, без номера ТЗ — обязательно"),
+    orgunit: z.string().max(35).optional().describe("Оргединица; SAP заполняет её сам из оргструктуры"),
   })
-  .strict();
+  .strict()
+  .refine((e) => e.prjct || e.ytr_key, { message: "Нужен ext.prjct или ext.ytr_key" })
+  .refine((e) => e.rqsnb || e.ytr_key || e.descr, {
+    message: "Без номера ТЗ описание работ (ext.descr) обязательно — в CAT2 его вводят вручную",
+  });
 
 export const catsRecord = z
   .object({
