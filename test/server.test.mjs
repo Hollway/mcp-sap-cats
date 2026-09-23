@@ -37,6 +37,7 @@ before(async () => {
         SAP_USER: "tester",
         SAP_PASSWORD: "secret",
         SAP_CATS_PROFILE: "TIME_W1",
+        SAP_LOCK_RETRY_DELAY_MS: "1",
         NO_PROXY: "127.0.0.1,localhost",
       },
     }),
@@ -56,17 +57,39 @@ const call = async (name, args) => {
 
 const record = { workdate: "2026-09-21", hours: 2, ext: { prjct: "PRJ01" } };
 
-test("сервер публикует все семь инструментов", async () => {
+test("сервер публикует все девять инструментов", async () => {
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map((t) => t.name).sort(), [
     "cats_capacity",
     "cats_change",
     "cats_delete",
     "cats_insert",
+    "cats_projects",
     "cats_read",
     "cats_release",
     "cats_validate",
+    "cats_whoami",
   ]);
+});
+
+test("cats_whoami: ответ без messages, ошибка MCP003 — isError", async () => {
+  replies.set("/whoami", [200, { user: "TESTER", pernr: "00012345", name: "Тест", orgeh: "1", orgunit: "Отдел", messages: [] }]);
+  const found = await call("cats_whoami", {});
+  assert.equal(found.isError, undefined);
+  assert.equal(JSON.parse(found.text).pernr, "00012345");
+  assert.equal(JSON.parse(found.text).messages, undefined);
+
+  replies.set("/whoami", [200, { user: "TESTER", pernr: "00000000", messages: [{ type: "E", id: "MCP", number: "003", text: "Нет табельного", row: 0 }] }]);
+  const missing = await call("cats_whoami", {});
+  assert.equal(missing.isError, true);
+  assert.match(missing.text, /Нет табельного \(MCP003\)/);
+});
+
+test("cats_projects: параметры поиска уходят в хендлер", async () => {
+  replies.set("/projects", [200, { projects: [{ prjct: "PRJ01", text: "Проект" }], requests: [{ rqsnb: "00001", text: "ТЗ" }], messages: [] }]);
+  const result = await call("cats_projects", { prjct: "PRJ01" });
+  assert.deepEqual(result.sent.body, { prjct: "PRJ01" });
+  assert.equal(JSON.parse(result.text).requests[0].rqsnb, "00001");
 });
 
 test("cats_read: фильтр status уходит в хендлер, к строкам добавляется status_text", async () => {
@@ -144,8 +167,10 @@ test("cats_change, cats_delete, cats_release пробрасывают ответ
   replies.set("/delete", [200, { deleted: [{ row: 1, counter: "1" }], committed: true, messages: [] }]);
   replies.set("/release", [200, { released: [{ row: 1, counter: "1", status: "30" }], messages: [] }]);
 
-  const changed = await call("cats_change", { pernr: "12345", records: [{ ...record, counter: "1" }] });
+  const changed = await call("cats_change", { pernr: "12345", records: [{ ...record, counter: "1", longtext: "строка 1\nстрока 2" }] });
   assert.equal(changed.sent.body.test, false);
+  assert.equal(changed.sent.body.norm_hours, 8);
+  assert.equal(changed.sent.body.records[0].longtext, "строка 1\nстрока 2");
   assert.equal(JSON.parse(changed.text).changed.length, 1);
 
   const deleted = await call("cats_delete", { counters: ["1"] });
@@ -154,4 +179,32 @@ test("cats_change, cats_delete, cats_release пробрасывают ответ
 
   const released = await call("cats_release", { pernr: "12345", date_from: "2026-09-21", date_to: "2026-09-21" });
   assert.equal(JSON.parse(released.text).released[0].status, "30");
+});
+
+test("prompts: три сценария, аргументы подставляются в текст", async () => {
+  const { prompts } = await client.listPrompts();
+  assert.deepEqual(prompts.map((p) => p.name).sort(), ["fill_gaps", "fill_week_like_last", "period_close_check"]);
+
+  const { messages } = await client.getPrompt({
+    name: "fill_gaps",
+    arguments: { pernr: "12345", date_from: "2026-09-01", date_to: "2026-09-30", prjct: "PRJ01" },
+  });
+  const text = messages[0].content.text;
+  assert.match(text, /табельного 12345/);
+  assert.match(text, /проектом PRJ01/);
+  assert.match(text, /cats_capacity/);
+  assert.match(text, /пока я не подтвердил/);
+  assert.doesNotMatch(text, /undefined/);
+});
+
+test("prompts: без pernr — подсказка про cats_whoami", async () => {
+  const { messages } = await client.getPrompt({ name: "period_close_check", arguments: { date_from: "2026-09-01", date_to: "2026-09-30" } });
+  assert.match(messages[0].content.text, /cats_whoami/);
+  assert.doesNotMatch(messages[0].content.text, /undefined/);
+});
+
+test("prompts: невалидная дата отвергается", async () => {
+  await assert.rejects(
+    client.getPrompt({ name: "period_close_check", arguments: { pernr: "12345", date_from: "01.09.2026", date_to: "2026-09-30" } }),
+  );
 });

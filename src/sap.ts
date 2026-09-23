@@ -37,6 +37,9 @@ export interface SapConfig {
   user: string;
   password: string;
   profile: string;
+  timeoutMs: number;
+  lockRetries: number;
+  lockRetryDelayMs: number;
 }
 
 export interface BapiMessage {
@@ -70,26 +73,60 @@ export function loadConfig(): SapConfig {
     user: required("SAP_USER"),
     password: required("SAP_PASSWORD"),
     profile: process.env.SAP_CATS_PROFILE ?? "TIME_D1",
+    timeoutMs: Number(process.env.SAP_TIMEOUT_MS ?? 60_000),
+    lockRetries: Number(process.env.SAP_LOCK_RETRIES ?? 2),
+    lockRetryDelayMs: Number(process.env.SAP_LOCK_RETRY_DELAY_MS ?? 2_000),
   };
 }
+
+/**
+ * LR2 «Транзакцию блокирует пользователь» — enqueue самого SAP, чаще всего
+ * своей же только что закрытой транзакции. Проходит со второй попытки, а
+ * повтор безопасен: при E-сообщении хендлер откатывает LUW, /insert к тому же
+ * идемпотентен по ключу.
+ */
+export const isLocked = (messages: BapiMessage[] | undefined): boolean =>
+  (messages ?? []).some((m) => m.type === "E" && m.id === "LR" && Number(m.number) === 2);
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class SapClient {
   constructor(private readonly cfg: SapConfig) {}
 
   async call<T>(path: string, method: "GET" | "POST", body?: unknown): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      const data = await this.request<T>(path, method, body);
+      const messages = (data as { messages?: BapiMessage[] }).messages;
+      if (!isLocked(messages) || attempt >= this.cfg.lockRetries) return data;
+      await sleep(this.cfg.lockRetryDelayMs * (attempt + 1));
+    }
+  }
+
+  private async request<T>(path: string, method: "GET" | "POST", body?: unknown): Promise<T> {
     const auth = Buffer.from(`${this.cfg.user}:${this.cfg.password}`).toString("base64");
     const url = new URL(this.cfg.url + path);
     url.searchParams.set("sap-client", this.cfg.client);
 
-    const response = await fetch(url, {
-      method,
-      headers: {
-        Authorization: `Basic ${auth}`,
-        Accept: "application/json",
-        ...(body ? { "Content-Type": "application/json" } : {}),
-      },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Basic ${auth}`,
+          Accept: "application/json",
+          ...(body ? { "Content-Type": "application/json" } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+        signal: AbortSignal.timeout(this.cfg.timeoutMs),
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "TimeoutError") {
+        throw new SapError(
+          `SAP не ответил за ${this.cfg.timeoutMs / 1000} с. Для записывающих вызовов результат неизвестен: проверьте cats_read, cats_insert можно безопасно повторить с тем же idempotency_key.`,
+        );
+      }
+      throw error;
+    }
 
     if (response.status === 401) {
       throw new SapError("SAP отклонил учётные данные. Проверьте SAP_USER и SAP_PASSWORD.", 401);

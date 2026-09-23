@@ -30,10 +30,52 @@ const fail = (error: unknown) => {
 };
 
 server.registerTool(
+  "cats_whoami",
+  {
+    title: "Мой табельный номер",
+    description:
+      "Табельный номер, ФИО и оргединица пользователя, под которым MCP ходит в SAP (ИТ 0105, подтип 0001). Вызывай первым, если пользователь не назвал табельный номер.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      const data = await sap.call<{ messages: BapiMessage[] }>("/whoami", "POST", {});
+      const { messages, ...rest } = data;
+      return hasErrors(messages) ? { ...ok(rest, messages), isError: true } : ok(rest, messages);
+    } catch (error) {
+      return fail(error);
+    }
+  },
+);
+
+server.registerTool(
+  "cats_projects",
+  {
+    title: "Активные проекты и номера ТЗ",
+    description:
+      "Справочник для ext.prjct и ext.rqsnb. Без параметров — все активные проекты; search — фильтр по коду или названию; prjct — номера ТЗ этого проекта (без удалённых).",
+    inputSchema: {
+      search: z.string().max(50).optional().describe("Часть кода или названия проекта, без учёта регистра"),
+      prjct: z.string().max(30).optional().describe("Код проекта — вернуть его номера ТЗ"),
+    },
+  },
+  async (args) => {
+    try {
+      const data = await sap.call<{ messages: BapiMessage[] }>("/projects", "POST", args);
+      const { messages, ...rest } = data;
+      return ok(rest, messages);
+    } catch (error) {
+      return fail(error);
+    }
+  },
+);
+
+server.registerTool(
   "cats_read",
   {
     title: "Вывод таймшита",
-    description: "Записи учёта времени по сотруднику за период: дата, объект отнесения, вид работ, часы, статус.",
+    description:
+      "Записи учёта времени по сотруднику за период: дата, объект отнесения, вид работ, часы, статус, признак подробного текста (longtext). Сторнированные записи (статус 60) выводятся, но в total_hours не входят.",
     inputSchema: {
       pernr,
       date_from: isoDate,
@@ -137,12 +179,14 @@ server.registerTool(
   "cats_change",
   {
     title: "Изменение записей таймшита",
-    description: "Меняет существующие записи по их ключу. Записи в статусах 30 и 50 изменению не подлежат.",
+    description:
+      "Меняет существующие записи по их ключу. Записи в статусах 30 и 50 изменению не подлежат. Проверяет дневной лимит: часы изменяемых записей заменяются новыми, а не складываются с ними.",
     inputSchema: {
       pernr,
       profile: profile.default(cfg.profile as "TIME_D1"),
       records: z.array(catsRecordWithCounter).min(1),
       test: z.boolean().default(false),
+      norm_hours: z.number().positive().default(8).describe("Дневная норма часов для проверки лимита"),
     },
   },
   async (args) => {
@@ -205,6 +249,80 @@ server.registerTool(
       return fail(error);
     }
   },
+);
+
+const who = (pernr: string | undefined) => (pernr ? `табельного ${pernr}` : "моего табельного (узнай его через cats_whoami)");
+
+const prompt = (text: string) => ({ messages: [{ role: "user" as const, content: { type: "text" as const, text } }] });
+
+const WRITE_RULES = `Правила записи:
+- ничего не записывай, пока я не подтвердил итоговую таблицу (дата, часы, проект, номер ТЗ, текст);
+- код проекта и номер ТЗ бери из cats_projects, не придумывай;
+- перед записью прогони cats_validate и покажи сообщения, если они есть;
+- один вызов cats_insert на весь набор, idempotency_key — 8–20 символов, уникальный для этого набора, при повторе после сбоя используй тот же ключ;
+- после записи покажи результат через cats_read.`;
+
+server.registerPrompt(
+  "fill_week_like_last",
+  {
+    title: "Заполнить неделю по образцу прошлой",
+    description: "Берёт записи прошлой недели как шаблон и раскладывает их на указанную неделю в пределах свободных часов.",
+    argsSchema: {
+      pernr: pernr.optional().describe("Табельный номер; если не задан — через cats_whoami"),
+      week_start: isoDate.describe("Понедельник заполняемой недели, YYYY-MM-DD"),
+    },
+  },
+  ({ pernr, week_start }) =>
+    prompt(`Заполни таймшит ${who(pernr)} на неделю, начинающуюся ${week_start}, по образцу предыдущей недели.
+
+1. cats_read за предыдущую неделю (понедельник–воскресенье перед ${week_start}) — это шаблон: проекты, номера ТЗ, тексты и распределение часов по дням недели. Сторнированные записи (статус 60) не учитывай.
+2. cats_capacity на заполняемую неделю — сколько свободно в каждый рабочий день. Нерабочие дни не заполняй, уже занятые часы не перекрывай.
+3. Предложи записи: тот же день недели → тот же набор, урезанный до свободных часов дня; если шаблонный день был нерабочим, а заполняемый рабочий (или наоборот) — спроси меня.
+
+${WRITE_RULES}`),
+);
+
+server.registerPrompt(
+  "fill_gaps",
+  {
+    title: "Дозаполнить свободные часы",
+    description: "Находит рабочие дни периода с недобором до нормы и закрывает их одним проектом.",
+    argsSchema: {
+      pernr: pernr.optional().describe("Табельный номер; если не задан — через cats_whoami"),
+      date_from: isoDate,
+      date_to: isoDate,
+      prjct: z.string().max(30).describe("Проект для недостающих часов"),
+      shorttext: z.string().max(40).optional().describe("Текст записи"),
+    },
+  },
+  ({ pernr, date_from, date_to, prjct, shorttext }) =>
+    prompt(`Дозаполни таймшит ${who(pernr)} за ${date_from} – ${date_to} проектом ${prjct}${shorttext ? ` с текстом «${shorttext}»` : ""}.
+
+1. cats_capacity за период: возьми только рабочие дни с free > 0.
+2. На каждый такой день — одна запись на free часов (шаг 0,25).
+3. Покажи таблицу дней и часов и итог.
+
+${WRITE_RULES}`),
+);
+
+server.registerPrompt(
+  "period_close_check",
+  {
+    title: "Проверка периода перед закрытием",
+    description: "Сводка по периоду: недобор и перебор по дням, записи в обработке, которые ещё не деблокированы.",
+    argsSchema: {
+      pernr: pernr.optional().describe("Табельный номер; если не задан — через cats_whoami"),
+      date_from: isoDate,
+      date_to: isoDate,
+    },
+  },
+  ({ pernr, date_from, date_to }) =>
+    prompt(`Проверь таймшит ${who(pernr)} за ${date_from} – ${date_to} перед закрытием периода.
+
+1. cats_capacity за период — рабочие дни с недобором (free > 0) и дни с перебором (free < 0), в том числе часы в выходные.
+2. cats_read за период — записи в статусе 10 «В обработке».
+3. Выведи коротко: дни с недобором и сколько не хватает, дни с перебором, итог часов против нормы, список записей в статусе 10.
+4. Предложи действия (дозаполнить, поправить, деблокировать через cats_release), но ничего не меняй без моего подтверждения. Учти, что cats_release в этой системе сразу даёт статус 30 «Утверждено», после этого запись правится только сторно.`),
 );
 
 await server.connect(new StdioServerTransport());
