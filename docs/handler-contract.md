@@ -1,6 +1,6 @@
 # Контракт ICF-хендлера
 
-Node-сторона написана против этого контракта. ABAP-класс ещё не создан — при его разработке контракт либо соблюдается, либо правится здесь и в `src/index.ts` одновременно.
+Node-сторона написана против этого контракта, ABAP-класс `ZCL_CATS_MCP_HANDLER` (`abap/`) его реализует. Изменения контракта вносятся здесь, в `src/index.ts` и в хендлере одновременно; Node-сторона контракта покрыта `npm test` (фейковый хендлер в `test/server.test.mjs`).
 
 ## Узел
 
@@ -16,7 +16,7 @@ Node-сторона написана против этого контракта.
   ```json
   { "type": "E", "id": "CATS", "number": "042", "text": "...", "row": 2 }
   ```
-- `row` — номер записи во входном массиве, начиная с 1. Без него сообщение относится ко всему вызову.
+- `row` — номер записи во входном массиве, начиная с 1. `0` — сообщение относится ко всему вызову. Поля `messages`, `committed` и массивы результатов присутствуют всегда, даже пустые (`/ui2/cl_json` вызывается без `compress`).
 - Ошибка полномочий — HTTP 403, неверные учётные данные — 401. Прикладные ошибки приходят с HTTP 200 и типом `E` в `messages`.
 
 ## Маршруты
@@ -24,12 +24,12 @@ Node-сторона написана против этого контракта.
 | Метод | Путь | BAPI | Фиксация |
 |---|---|---|---|
 | POST | `/read` | чтение `CATSDB` | — |
-| POST | `/capacity` | `CATSDB` + `HOLIDAY_GET` | — |
-| POST | `/validate` | `BAPI_CATIMESHEETMGR_INSERT`, `TESTRUN = 'X'` | нет |
-| POST | `/insert` | `BAPI_CATIMESHEETMGR_INSERT` | `BAPI_TRANSACTION_COMMIT` в том же вызове |
+| POST | `/capacity` | `CATSDB` + `DATE_CONVERT_TO_FACTORYDATE` (календарь `BY`) | — |
+| POST | `/validate` | `BAPI_CATIMESHEETMGR_INSERT`, `TESTRUN = 'X'` + дневной лимит | нет |
+| POST | `/insert` | `BAPI_CATIMESHEETMGR_INSERT` + дневной лимит | `BAPI_TRANSACTION_COMMIT` в том же вызове |
 | POST | `/change` | `BAPI_CATIMESHEETMGR_CHANGE` | то же |
 | POST | `/delete` | `BAPI_CATIMESHEETMGR_DELETE` | то же |
-| POST | `/release` | `BAPI_CATIMESHEETMGR_INSERT`, `RELEASE_DATA = 'X'` | то же |
+| POST | `/release` | `BAPI_CATIMESHEETMGR_CHANGE`, `RELEASE_DATA = 'X'`, ресенд строки из `CATSDB` | то же |
 
 **Фиксация обязана происходить внутри того же обращения к хендлеру, что и вызов BAPI.** При stateless HTTP каждый запрос — новая LUW, и запись пропадёт молча.
 

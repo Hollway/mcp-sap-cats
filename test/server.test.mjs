@@ -1,0 +1,157 @@
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+const requests = [];
+const replies = new Map();
+
+const handler = createServer((req, res) => {
+  let body = "";
+  req.on("data", (chunk) => (body += chunk));
+  req.on("end", () => {
+    const url = new URL(req.url, "http://localhost");
+    const route = url.pathname.replace("/sap/bc/zcats", "");
+    requests.push({ route, url, headers: req.headers, body: body ? JSON.parse(body) : undefined });
+    const [status, payload] = replies.get(route) ?? [404, { error: "no reply" }];
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(payload));
+  });
+});
+
+let client;
+
+before(async () => {
+  await new Promise((resolve) => handler.listen(0, "127.0.0.1", resolve));
+  const { port } = handler.address();
+  client = new Client({ name: "test", version: "0.0.0" });
+  await client.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: [fileURLToPath(new URL("../dist/index.js", import.meta.url))],
+      env: {
+        SAP_CATS_URL: `http://127.0.0.1:${port}/sap/bc/zcats/`,
+        SAP_CLIENT: "102",
+        SAP_USER: "tester",
+        SAP_PASSWORD: "secret",
+        SAP_CATS_PROFILE: "TIME_W1",
+        NO_PROXY: "127.0.0.1,localhost",
+      },
+    }),
+  );
+});
+
+after(async () => {
+  await client?.close();
+  handler.close();
+});
+
+const call = async (name, args) => {
+  requests.length = 0;
+  const result = await client.callTool({ name, arguments: args });
+  return { ...result, text: result.content.map((c) => c.text).join("\n"), sent: requests[0] };
+};
+
+const record = { workdate: "2026-09-21", hours: 2, ext: { prjct: "PRJ01" } };
+
+test("сервер публикует все семь инструментов", async () => {
+  const { tools } = await client.listTools();
+  assert.deepEqual(tools.map((t) => t.name).sort(), [
+    "cats_capacity",
+    "cats_change",
+    "cats_delete",
+    "cats_insert",
+    "cats_read",
+    "cats_release",
+    "cats_validate",
+  ]);
+});
+
+test("cats_read: фильтр status уходит в хендлер, к строкам добавляется status_text", async () => {
+  replies.set("/read", [200, { rows: [{ counter: "1", status: "30" }, { counter: "2", status: "99" }], total_hours: 3 }]);
+  const result = await call("cats_read", { pernr: "12345", date_from: "2026-09-01", date_to: "2026-09-30", status: ["30"] });
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(result.sent.body.status, ["30"]);
+  assert.equal(result.sent.url.searchParams.get("sap-client"), "102");
+  assert.equal(result.sent.headers.authorization, `Basic ${Buffer.from("tester:secret").toString("base64")}`);
+  const payload = JSON.parse(result.text);
+  assert.equal(payload.rows[0].status_text, "Утверждено");
+  assert.equal(payload.rows[1].status_text, "99");
+});
+
+test("cats_validate: пустой messages — ok: true", async () => {
+  replies.set("/validate", [200, { messages: [] }]);
+  const result = await call("cats_validate", { pernr: "12345", records: [record] });
+  assert.deepEqual(JSON.parse(result.text), { ok: true });
+});
+
+test("cats_validate: ошибка дневного лимита — ok: false и текст сообщения", async () => {
+  replies.set("/validate", [200, { messages: [{ type: "E", id: "MCP", number: "002", text: "Превышен лимит", row: 1 }] }]);
+  const result = await call("cats_validate", { pernr: "12345", records: [record], norm_hours: 6 });
+  assert.equal(result.sent.body.norm_hours, 6);
+  assert.match(result.text, /"ok": false/);
+  assert.match(result.text, /Ошибка · строка 1: Превышен лимит \(MCP002\)/);
+});
+
+test("cats_insert: умолчания профиля, release и norm_hours подставляются до вызова SAP", async () => {
+  replies.set("/insert", [200, { created: [{ row: 1, counter: "000000000001" }], committed: true, messages: [] }]);
+  const result = await call("cats_insert", { pernr: "12345", records: [record], idempotency_key: "TEST0001" });
+  assert.equal(result.sent.body.profile, "TIME_W1");
+  assert.equal(result.sent.body.release, false);
+  assert.equal(result.sent.body.norm_hours, 8);
+  assert.equal(result.sent.body.records[0].wagetype, "M120");
+  assert.equal(JSON.parse(result.text).committed, true);
+});
+
+test("cats_insert: повтор с тем же ключом — committed: false и сообщение S", async () => {
+  replies.set("/insert", [
+    200,
+    { created: [{ row: 1, counter: "000000000001" }], committed: false, messages: [{ type: "S", id: "MCP", number: "001", text: "Уже создано", row: 0 }] },
+  ]);
+  const result = await call("cats_insert", { pernr: "12345", records: [record], idempotency_key: "TEST0001" });
+  assert.equal(result.isError, undefined);
+  assert.match(result.text, /"committed": false/);
+  assert.match(result.text, /Успешно · Уже создано \(MCP001\)/);
+  assert.doesNotMatch(result.text, /строка 0/);
+});
+
+test("невалидный ввод отвергается до обращения к SAP", async () => {
+  const cases = [
+    ["cats_read", { pernr: "ABC", date_from: "2026-09-01", date_to: "2026-09-30" }],
+    ["cats_insert", { pernr: "12345", records: [record], idempotency_key: "short" }],
+    ["cats_insert", { pernr: "12345", records: [{ ...record, ext: {} }], idempotency_key: "TEST0001" }],
+    ["cats_validate", { pernr: "12345", records: [] }],
+    ["cats_delete", { counters: [] }],
+  ];
+  for (const [name, args] of cases) {
+    const result = await call(name, args);
+    assert.equal(result.isError, true, `${name} ${JSON.stringify(args)}`);
+    assert.equal(result.sent, undefined, `${name} не должен был дойти до SAP`);
+  }
+});
+
+test("HTTP 403 от SAP — ошибка инструмента с пояснением про полномочия", async () => {
+  replies.set("/capacity", [403, {}]);
+  const result = await call("cats_capacity", { pernr: "54321", date_from: "2026-09-21", date_to: "2026-09-21" });
+  assert.equal(result.isError, true);
+  assert.match(result.text, /P_ORGIN/);
+});
+
+test("cats_change, cats_delete, cats_release пробрасывают ответ хендлера", async () => {
+  replies.set("/change", [200, { changed: [{ row: 1, counter: "1" }], committed: true, messages: [] }]);
+  replies.set("/delete", [200, { deleted: [{ row: 1, counter: "1" }], committed: true, messages: [] }]);
+  replies.set("/release", [200, { released: [{ row: 1, counter: "1", status: "30" }], messages: [] }]);
+
+  const changed = await call("cats_change", { pernr: "12345", records: [{ ...record, counter: "1" }] });
+  assert.equal(changed.sent.body.test, false);
+  assert.equal(JSON.parse(changed.text).changed.length, 1);
+
+  const deleted = await call("cats_delete", { counters: ["1"] });
+  assert.deepEqual(deleted.sent.body.counters, ["1"]);
+  assert.equal(JSON.parse(deleted.text).committed, true);
+
+  const released = await call("cats_release", { pernr: "12345", date_from: "2026-09-21", date_to: "2026-09-21" });
+  assert.equal(JSON.parse(released.text).released[0].status, "30");
+});
