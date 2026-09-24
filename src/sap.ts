@@ -34,8 +34,9 @@ function loadDotenv(): void {
 export interface SapConfig {
   url: string;
   client: string;
-  user: string;
-  password: string;
+  /** Пусты в HTTP-режиме: там учётные данные приходят с каждым запросом клиента. */
+  user?: string;
+  password?: string;
   profile: string;
   timeoutMs: number;
   lockRetries: number;
@@ -58,8 +59,15 @@ export class SapError extends Error {
   }
 }
 
-export function loadConfig(): SapConfig {
+export type McpTransport = "stdio" | "http";
+
+export function loadConfig(): SapConfig & { transport: McpTransport } {
   loadDotenv();
+
+  const transport = process.env.MCP_TRANSPORT || "stdio";
+  if (transport !== "stdio" && transport !== "http") {
+    throw new Error(`MCP_TRANSPORT=${transport}: допустимо stdio или http`);
+  }
 
   const required = (name: string): string => {
     const value = process.env[name];
@@ -68,10 +76,10 @@ export function loadConfig(): SapConfig {
   };
 
   return {
+    transport,
     url: required("SAP_CATS_URL").replace(/\/+$/, ""),
     client: process.env.SAP_CLIENT ?? "100",
-    user: required("SAP_USER"),
-    password: required("SAP_PASSWORD"),
+    ...(transport === "stdio" ? { user: required("SAP_USER"), password: required("SAP_PASSWORD") } : {}),
     profile: process.env.SAP_CATS_PROFILE ?? "TIME_D1",
     timeoutMs: Number(process.env.SAP_TIMEOUT_MS ?? 60_000),
     lockRetries: Number(process.env.SAP_LOCK_RETRIES ?? 2),
@@ -90,8 +98,16 @@ export const isLocked = (messages: BapiMessage[] | undefined): boolean =>
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+export const basicAuthorization = (user: string, password: string) =>
+  `Basic ${Buffer.from(`${user}:${password}`).toString("base64")}`;
+
 export class SapClient {
-  constructor(private readonly cfg: SapConfig) {}
+  private readonly authorization: string;
+
+  /** authorization — готовый заголовок клиента в HTTP-режиме; без него — логин из .env. */
+  constructor(private readonly cfg: SapConfig, authorization?: string) {
+    this.authorization = authorization ?? basicAuthorization(cfg.user ?? "", cfg.password ?? "");
+  }
 
   async call<T>(path: string, method: "GET" | "POST", body?: unknown): Promise<T> {
     for (let attempt = 0; ; attempt++) {
@@ -103,7 +119,6 @@ export class SapClient {
   }
 
   private async request<T>(path: string, method: "GET" | "POST", body?: unknown): Promise<T> {
-    const auth = Buffer.from(`${this.cfg.user}:${this.cfg.password}`).toString("base64");
     const url = new URL(this.cfg.url + path);
     url.searchParams.set("sap-client", this.cfg.client);
 
@@ -112,7 +127,7 @@ export class SapClient {
       response = await fetch(url, {
         method,
         headers: {
-          Authorization: `Basic ${auth}`,
+          Authorization: this.authorization,
           Accept: "application/json",
           ...(body ? { "Content-Type": "application/json" } : {}),
         },
@@ -129,7 +144,7 @@ export class SapClient {
     }
 
     if (response.status === 401) {
-      throw new SapError("SAP отклонил учётные данные. Проверьте SAP_USER и SAP_PASSWORD.", 401);
+      throw new SapError("SAP отклонил учётные данные. Проверьте логин и пароль SAP (SAP_USER и SAP_PASSWORD в .env или заголовок Authorization в настройках MCP-клиента).", 401);
     }
     if (response.status === 403) {
       throw new SapError(
