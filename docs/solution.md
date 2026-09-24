@@ -53,7 +53,7 @@ MCP-клиент  →  MCP-сервер (Node)  →  HTTPS + Basic  →  ICF-у�
 
 ## Инструменты
 
-Девять инструментов: семь по ТЗ и два справочных. Обязательные параметры помечены `*`. Пишущие и проверяющие инструменты возвращают `messages[]` — разобранный `BAPIRET2` (`type`, `id`, `number`, `text`, `row` — номер записи во входном массиве, `0` — весь вызов).
+Десять инструментов: семь по ТЗ, два справочных и сводка. Обязательные параметры помечены `*`. Пишущие и проверяющие инструменты возвращают `messages[]` — разобранный `BAPIRET2` (`type`, `id`, `number`, `text`, `row` — номер записи во входном массиве, `0` — весь вызов).
 
 ### `cats_whoami` — мой табельный номер
 
@@ -75,6 +75,13 @@ MCP-клиент  →  MCP-сервер (Node)  →  HTTPS + Basic  →  ICF-у�
 **Выход:** `rows[]` (counter, workdate, pernr, rec_cctr, rec_order, acttype, wagetype, unit, hours, status, status_text, rqsnb, prjct, descr, orgunit, longtext — признак подробного текста, longtext_text — сам текст), `total_hours`
 
 `total_hours` не учитывает статусы 50 и 60 — сами строки выводятся.
+
+### `cats_summary` — сводка по проектам и номерам ТЗ
+
+**Вход:** `pernr*`, `date_from*`, `date_to*`, `by` (`request` — проект + номер ТЗ, `project` — только проект), `weeks` (false)
+**Выход:** `groups[]` (prjct, rqsnb, descr, hours, days, records, by_status, weeks), `total_hours`, `days`, `by_status`, `weeks`
+
+Считается на стороне MCP поверх `/read`, ABAP не меняется. Статусы 50 и 60 не входят, как и в `total_hours` `cats_read`. Записи без номера ТЗ группируются по проекту и описанию. Ключ недели — её понедельник. Проверено на реальных данных за месяц: итог совпадает с `total_hours` `cats_read`.
 
 ### `cats_capacity` — свободные часы по дням
 

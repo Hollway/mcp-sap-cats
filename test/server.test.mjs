@@ -57,7 +57,7 @@ const call = async (name, args) => {
 
 const record = { workdate: "2026-09-21", hours: 2, ext: { prjct: "PRJ01", descr: "Работа" } };
 
-test("сервер публикует все девять инструментов", async () => {
+test("сервер публикует все десять инструментов", async () => {
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map((t) => t.name).sort(), [
     "cats_capacity",
@@ -67,6 +67,7 @@ test("сервер публикует все девять инструменто
     "cats_projects",
     "cats_read",
     "cats_release",
+    "cats_summary",
     "cats_validate",
     "cats_whoami",
   ]);
@@ -155,6 +156,22 @@ test("cats_read: фильтр status уходит в хендлер, к стро
   assert.equal(payload.rows[1].status_text, "99");
 });
 
+test("cats_summary: читает /read без своих параметров, номер ТЗ без ведущих нулей", async () => {
+  replies.set("/read", [200, { rows: [
+    { counter: "1", workdate: "2026-09-21", hours: 2, status: "10", prjct: "PRJ01", rqsnb: "00562", descr: "ТЗ" },
+    { counter: "2", workdate: "2026-09-22", hours: 1, status: "30", prjct: "PRJ01", rqsnb: 562, descr: "ТЗ" },
+    { counter: "3", workdate: "2026-09-22", hours: 1, status: "10", prjct: "PRJ01", rqsnb: "00000", descr: "Без ТЗ" },
+  ], total_hours: 4 }]);
+  const result = await call("cats_summary", { pernr: "12345", date_from: "2026-09-01", date_to: "2026-09-30", weeks: true });
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(result.sent.body, { pernr: "12345", date_from: "2026-09-01", date_to: "2026-09-30" });
+  const payload = JSON.parse(result.text);
+  assert.equal(payload.pernr, "00012345");
+  assert.equal(payload.total_hours, 4);
+  assert.deepEqual(payload.groups.map((g) => [g.rqsnb, g.hours]), [["562", 3], ["", 1]]);
+  assert.deepEqual(payload.weeks, { "2026-09-21": 4 });
+});
+
 test("cats_validate: пустой messages — ok: true", async () => {
   replies.set("/validate", [200, { messages: [] }]);
   const result = await call("cats_validate", { pernr: "12345", records: [record] });
@@ -207,11 +224,11 @@ test("невалидный ввод отвергается до обращени
   }
 });
 
-test("HTTP 403 от SAP — ошибка инструмента с пояснением про полномочия", async () => {
+test("HTTP 403 от SAP — ошибка инструмента с пояснением про узел SICF", async () => {
   replies.set("/capacity", [403, {}]);
   const result = await call("cats_capacity", { pernr: "54321", date_from: "2026-09-21", date_to: "2026-09-21" });
   assert.equal(result.isError, true);
-  assert.match(result.text, /P_ORGIN/);
+  assert.match(result.text, /SICF/);
 });
 
 test("cats_change, cats_delete, cats_release пробрасывают ответ хендлера", async () => {

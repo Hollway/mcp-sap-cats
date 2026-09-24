@@ -111,7 +111,7 @@ test("SapClient: Basic-авторизация, мандант в sap-client, JSO
 
 for (const [status, pattern] of [
   [401, /учётные данные/],
-  [403, /P_ORGIN/],
+  [403, /SICF/],
   [500, /Хендлер вернул 500: dump/],
 ]) {
   test(`SapClient: HTTP ${status} превращается в SapError`, () =>
@@ -194,3 +194,42 @@ test("SapClient: таймаут превращается в SapError с подс
       });
     },
   ));
+
+test("summarize: группы проект + ТЗ, без ТЗ — по описанию, статусы 50 и 60 не считаются", async () => {
+  const { summarize } = await import("../dist/summary.js");
+  const rows = [
+    { workdate: "2026-09-21", hours: 2, status: "10", prjct: "PRJ01", rqsnb: "562", descr: "ТЗ 562" },
+    { workdate: "2026-09-22", hours: 3, status: "30", prjct: "PRJ01", rqsnb: "562", descr: "ТЗ 562" },
+    { workdate: "2026-09-22", hours: 1, status: "10", prjct: "PRJ01", rqsnb: "", descr: "Совещание" },
+    { workdate: "2026-09-23", hours: 1.5, status: "10", prjct: "PRJ01", rqsnb: "", descr: "Консультация" },
+    { workdate: "2026-09-23", hours: 4, status: "50", prjct: "PRJ01", rqsnb: "562", descr: "ТЗ 562" },
+    { workdate: "2026-09-24", hours: 5, status: "60", prjct: "PRJ02", rqsnb: "1", descr: "Сторно" },
+    { workdate: "2026-09-24", hours: 0, status: "30", prjct: "PRJ01", rqsnb: "562", descr: "История" },
+  ];
+  const result = summarize(rows, "request", false);
+  assert.equal(result.total_hours, 7.5);
+  assert.equal(result.days, 3);
+  assert.deepEqual(result.by_status, { "10": 4.5, "30": 3 });
+  assert.equal(result.weeks, undefined);
+  assert.deepEqual(result.groups.map((g) => [g.prjct, g.rqsnb, g.descr, g.hours, g.days, g.records]), [
+    ["PRJ01", "562", "ТЗ 562", 5, 2, 2],
+    ["PRJ01", "", "Консультация", 1.5, 1, 1],
+    ["PRJ01", "", "Совещание", 1, 1, 1],
+  ]);
+  assert.deepEqual(result.groups[0].by_status, { "10": 2, "30": 3 });
+});
+
+test("summarize: by project и разбивка по неделям с понедельника", async () => {
+  const { summarize, weekOf } = await import("../dist/summary.js");
+  assert.equal(weekOf("2026-09-27"), "2026-09-21");
+  assert.equal(weekOf("2026-09-28"), "2026-09-28");
+  const rows = [
+    { workdate: "2026-09-27", hours: 1, status: "10", prjct: "PRJ01", rqsnb: "1" },
+    { workdate: "2026-09-28", hours: 2.25, status: "10", prjct: "PRJ01", rqsnb: "2" },
+    { workdate: "2026-09-21", hours: 0.5, status: "30", prjct: "PRJ02", rqsnb: "" },
+  ];
+  const result = summarize(rows, "project", true);
+  assert.deepEqual(result.groups.map((g) => [g.prjct, g.hours, g.rqsnb]), [["PRJ01", 3.25, undefined], ["PRJ02", 0.5, undefined]]);
+  assert.deepEqual(Object.keys(result.groups[0].weeks), ["2026-09-21", "2026-09-28"]);
+  assert.deepEqual(result.weeks, { "2026-09-21": 1.5, "2026-09-28": 2.25 });
+});
