@@ -287,7 +287,8 @@ server.registerTool(
   "cats_delete",
   {
     title: "Удаление записей таймшита",
-    description: "Удаляет записи по ключу.",
+    description:
+      "Удаляет записи по ключу. Запись, которая ни разу не утверждалась, SAP удаляет физически вместе с подробным текстом; утверждённая (30) и её новые версии переходят в статус 60 «Сторнировано».",
     inputSchema: {
       profile: profile.default(cfg.profile as "TIME_D1"),
       counters: z.array(z.string().max(12)).min(1),

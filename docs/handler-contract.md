@@ -28,7 +28,7 @@ Node-сторона написана против этого контракта,
 | POST | `/validate` | `BAPI_CATIMESHEETMGR_INSERT`, `TESTRUN = 'X'` + дневной лимит | нет |
 | POST | `/insert` | `BAPI_CATIMESHEETMGR_INSERT` + дневной лимит | `BAPI_TRANSACTION_COMMIT` в том же вызове |
 | POST | `/change` | `BAPI_CATIMESHEETMGR_CHANGE` + дневной лимит (часы изменяемых записей не складываются с новыми) | то же |
-| POST | `/delete` | `BAPI_CATIMESHEETMGR_DELETE` — запись переходит в статус `60`, физически не удаляется | то же |
+| POST | `/delete` | `BAPI_CATIMESHEETMGR_DELETE` — неутверждённая запись (`10`) удаляется физически, утверждённая (`30`) и её новые версии переходят в `60` | то же |
 | POST | `/release` | `BAPI_CATIMESHEETMGR_CHANGE`, `RELEASE_DATA = 'X'`, ресенд строк статуса `10` из `CATSDB`; процедура утверждения не настроена, итог — статус `30` | то же |
 | POST | `/whoami` | `PA0105` (подтип `0001`) по `sy-uname`, `PA0001`, `T527X` | — |
 | POST | `/projects` | `ZBTPRJCT`/`ZBTPRJCTT`; с `prjct` — ТЗ из `ZBTPROJECT`/`ZBTREQSPT` и `ZYTRPROJ`; с `ytr_key` — пара из `ZYTRPROJ`, затем `ZBTPROJECT` | — |
