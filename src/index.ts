@@ -13,6 +13,7 @@ import {
   ytrKey,
 } from "./schemas.js";
 import { BapiMessage, SapClient, SapError, formatMessages, hasErrors, loadConfig } from "./sap.js";
+import { SummaryRow, summarize } from "./summary.js";
 
 const cfg = loadConfig();
 const sap = new SapClient(cfg);
@@ -169,6 +170,31 @@ server.registerTool(
         status_text: CATS_STATUS[r.status] ?? r.status,
       }));
       return ok({ ...data, rows });
+    } catch (error) {
+      return fail(error);
+    }
+  },
+);
+
+server.registerTool(
+  "cats_summary",
+  {
+    title: "Сводка по проектам и номерам ТЗ",
+    description:
+      "Часы сотрудника за период, сгруппированные по проекту и номеру ТЗ (by: request) или только по проекту (by: project), с разбивкой по статусам и, если weeks, по неделям (ключ — понедельник недели). Записи без номера ТЗ группируются по проекту и описанию. Статусы 50 и 60 не считаются, как и в total_hours cats_read. Для отчётов и закрытия месяца; отдельные записи — через cats_read.",
+    inputSchema: {
+      pernr,
+      date_from: isoDate,
+      date_to: isoDate,
+      by: z.enum(["request", "project"]).default("request").describe("request — проект + номер ТЗ, project — только проект"),
+      weeks: z.boolean().default(false).describe("Добавить разбивку часов по неделям"),
+    },
+  },
+  async ({ by, weeks, ...args }) => {
+    try {
+      const data = await sap.call<{ rows: Array<SummaryRow & { rqsnb: unknown }> }>("/read", "POST", args);
+      const rows = data.rows.map((r) => ({ ...r, rqsnb: r.rqsnb && Number(r.rqsnb) ? String(Number(r.rqsnb)) : "" }));
+      return ok({ pernr: pernrText(args.pernr), date_from: args.date_from, date_to: args.date_to, ...summarize(rows, by, weeks) });
     } catch (error) {
       return fail(error);
     }
