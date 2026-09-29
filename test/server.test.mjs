@@ -32,6 +32,8 @@ before(async () => {
       command: process.execPath,
       args: [fileURLToPath(new URL("../dist/index.js", import.meta.url))],
       env: {
+        SAP_CATS_DOTENV: "0",
+        MCP_TRANSPORT: "stdio",
         SAP_CATS_URL: `http://127.0.0.1:${port}/sap/bc/zcats/`,
         SAP_CLIENT: "102",
         SAP_USER: "tester",
@@ -73,6 +75,19 @@ test("сервер публикует все десять инструменто
   ]);
 });
 
+test("аннотации: чтение помечено readOnly, правка, удаление и деблокирование — destructive", async () => {
+  const { tools } = await client.listTools();
+  const hints = Object.fromEntries(tools.map((t) => [t.name, t.annotations ?? {}]));
+  for (const name of ["cats_whoami", "cats_projects", "cats_read", "cats_summary", "cats_capacity", "cats_validate"]) {
+    assert.equal(hints[name].readOnlyHint, true, name);
+  }
+  assert.deepEqual([hints.cats_insert.readOnlyHint, hints.cats_insert.destructiveHint, hints.cats_insert.idempotentHint], [false, false, true]);
+  for (const name of ["cats_change", "cats_delete", "cats_release"]) {
+    assert.equal(hints[name].destructiveHint, true, name);
+    assert.match(tools.find((t) => t.name === name).description, /без отмены/);
+  }
+});
+
 test("cats_whoami: ответ без messages, ошибка MCP003 — isError", async () => {
   replies.set("/whoami", [200, { user: "TESTER", pernr: "00012345", name: "Тест", orgeh: "1", orgunit: "Отдел", messages: [] }]);
   const found = await call("cats_whoami", {});
@@ -80,7 +95,7 @@ test("cats_whoami: ответ без messages, ошибка MCP003 — isError",
   assert.equal(JSON.parse(found.text).pernr, "00012345");
   assert.equal(JSON.parse(found.text).messages, undefined);
 
-  replies.set("/whoami", [200, { user: "TESTER", pernr: "00000000", messages: [{ type: "E", id: "MCP", number: "003", text: "Нет табельного", row: 0 }] }]);
+  replies.set("/whoami", [200, { user: "TESTER", pernr: 0, messages: [{ type: "E", id: "MCP", number: 3, text: "Нет табельного", row: 0 }] }]);
   const missing = await call("cats_whoami", {});
   assert.equal(missing.isError, true);
   assert.match(missing.text, /Нет табельного \(MCP003\)/);
@@ -137,11 +152,35 @@ test("ext.ytr_key: неоднозначный ключ и расхождение
   assert.deepEqual(mismatch.all.map((r) => r.route), ["/projects"]);
 });
 
-test("cats_projects: параметры поиска уходят в хендлер", async () => {
-  replies.set("/projects", [200, { projects: [{ prjct: "PRJ01", text: "Проект" }], requests: [{ rqsnb: "00001", text: "ТЗ" }], messages: [] }]);
+test("ext.ytr_key: удалённая задача (статус 7 строкой или числом) и задача без номера ТЗ — ошибка без записи", async () => {
+  for (const ytr_status of ["7", 7]) {
+    replies.set("/projects", [200, { projects: [], requests: [{ prjct: "П", rqsnb: 5, ytr_key: "SAP-7", ytr_status }], messages: [] }]);
+    const deleted = await call("cats_insert", { pernr: "12345", records: [{ ...record, ext: { ytr_key: "SAP-7" } }], idempotency_key: "TEST0004" });
+    assert.equal(deleted.isError, true, String(ytr_status));
+    assert.match(deleted.text, /удалена в Трекере/);
+    assert.deepEqual(deleted.all.map((r) => r.route), ["/projects"]);
+  }
+
+  replies.set("/projects", [200, { projects: [], requests: [
+    { prjct: "П", rqsnb: 5, ytr_key: "SAP-8", ytr_status: "7" },
+    { prjct: "Q", rqsnb: 6, ytr_key: "SAP-8", ytr_status: "3" },
+  ], messages: [] }]);
+  replies.set("/validate", [200, { messages: [] }]);
+  const alive = await call("cats_validate", { pernr: "12345", records: [{ ...record, ext: { ytr_key: "SAP-8" } }] });
+  assert.deepEqual(alive.all[1].body.records[0].ext, { prjct: "Q", rqsnb: "6" });
+
+  replies.set("/projects", [200, { projects: [], requests: [{ prjct: "П", rqsnb: 0, ytr_key: "SAP-9", ytr_status: "3" }], messages: [] }]);
+  const noRequest = await call("cats_validate", { pernr: "12345", records: [{ ...record, ext: { ytr_key: "SAP-9" } }] });
+  assert.equal(noRequest.isError, true);
+  assert.match(noRequest.text, /не привязана к номеру ТЗ/);
+  assert.deepEqual(noRequest.all.map((r) => r.route), ["/projects"]);
+});
+
+test("cats_projects: параметры поиска уходят в хендлер, номер ТЗ без ведущих нулей", async () => {
+  replies.set("/projects", [200, { projects: [{ prjct: "PRJ01", text: "Проект" }], requests: [{ rqsnb: "00001", text: "ТЗ" }, { rqsnb: 0, text: "Без номера" }], messages: [] }]);
   const result = await call("cats_projects", { prjct: "PRJ01" });
   assert.deepEqual(result.sent.body, { prjct: "PRJ01" });
-  assert.equal(JSON.parse(result.text).requests[0].rqsnb, "00001");
+  assert.deepEqual(JSON.parse(result.text).requests.map((r) => r.rqsnb), ["1", ""]);
 });
 
 test("cats_read: фильтр status уходит в хендлер, к строкам добавляется status_text", async () => {
@@ -204,6 +243,7 @@ test("cats_insert: повтор с тем же ключом — committed: false
   const result = await call("cats_insert", { pernr: "12345", records: [record], idempotency_key: "TEST0001" });
   assert.equal(result.isError, undefined);
   assert.match(result.text, /"committed": false/);
+  assert.match(result.text, /Ничего не записано: этот idempotency_key уже использован/);
   assert.match(result.text, /Успешно · Уже создано \(MCP001\)/);
   assert.doesNotMatch(result.text, /строка 0/);
 });
@@ -215,7 +255,15 @@ test("невалидный ввод отвергается до обращени
     ["cats_insert", { pernr: "12345", records: [{ ...record, ext: {} }], idempotency_key: "TEST0001" }],
     ["cats_validate", { pernr: "12345", records: [] }],
     ["cats_delete", { counters: [] }],
+    ["cats_delete", { counters: ["abc"] }],
     ["cats_insert", { pernr: "12345", records: [{ ...record, ext: { prjct: "PRJ01" } }], idempotency_key: "TEST0001" }],
+    ["cats_insert", { pernr: "12345", records: [{ ...record, workdate: "2026-02-30" }], idempotency_key: "TEST0001" }],
+    ["cats_read", { pernr: "12345", date_from: "2026-09-30", date_to: "2026-09-01" }],
+    ["cats_capacity", { pernr: "12345", date_from: "2026-09-30", date_to: "2026-09-01" }],
+    ["cats_summary", { pernr: "12345", date_from: "2026-09-30", date_to: "2026-09-01" }],
+    ["cats_release", { pernr: "12345" }],
+    ["cats_release", { pernr: "12345", date_from: "2026-09-01" }],
+    ["cats_release", { pernr: "12345", date_from: "2026-09-30", date_to: "2026-09-01" }],
   ];
   for (const [name, args] of cases) {
     const result = await call(name, args);
@@ -231,23 +279,52 @@ test("HTTP 403 от SAP — ошибка инструмента с поясне�
   assert.match(result.text, /SICF/);
 });
 
-test("cats_change, cats_delete, cats_release пробрасывают ответ хендлера", async () => {
-  replies.set("/change", [200, { changed: [{ row: 1, counter: "1" }], committed: true, messages: [] }]);
-  replies.set("/delete", [200, { deleted: [{ row: 1, counter: "1" }], committed: true, messages: [] }]);
-  replies.set("/release", [200, { released: [{ row: 1, counter: "1", status: "30" }], messages: [] }]);
+test("cats_change, cats_delete, cats_release пробрасывают ответ хендлера, counter дополняется нулями", async () => {
+  replies.set("/change", [200, { changed: [{ row: 1, counter: "000000000001" }], committed: true, messages: [] }]);
+  replies.set("/delete", [200, { deleted: [{ row: 1, counter: "000000000001" }], committed: true, messages: [] }]);
+  replies.set("/release", [200, { released: [{ row: 1, counter: "000000000001", status: "30" }], committed: true, messages: [] }]);
 
   const changed = await call("cats_change", { pernr: "12345", records: [{ ...record, counter: "1", longtext: "строка 1\nстрока 2" }] });
   assert.equal(changed.sent.body.test, false);
   assert.equal(changed.sent.body.norm_hours, 8);
+  assert.equal(changed.sent.body.records[0].counter, "000000000001");
+  assert.equal(changed.sent.body.records[0].wagetype, undefined);
+  assert.equal(changed.sent.body.records[0].unit, undefined);
   assert.equal(changed.sent.body.records[0].longtext, "строка 1\nстрока 2");
   assert.equal(JSON.parse(changed.text).changed.length, 1);
 
   const deleted = await call("cats_delete", { counters: ["1"] });
-  assert.deepEqual(deleted.sent.body.counters, ["1"]);
+  assert.deepEqual(deleted.sent.body.counters, ["000000000001"]);
+  assert.equal(deleted.sent.body.profile, undefined);
   assert.equal(JSON.parse(deleted.text).committed, true);
 
   const released = await call("cats_release", { pernr: "12345", date_from: "2026-09-21", date_to: "2026-09-21" });
   assert.equal(JSON.parse(released.text).released[0].status, "30");
+  assert.equal(JSON.parse(released.text).committed, true);
+
+  const byCounter = await call("cats_release", { pernr: "12345", counters: ["388598"] });
+  assert.deepEqual(byCounter.sent.body.counters, ["000000388598"]);
+});
+
+test("cats_release: откат виден — committed: false и ошибка BAPI", async () => {
+  replies.set("/release", [200, { released: [], committed: false, messages: [{ type: "E", id: "ZCATS", number: 1, text: "Проект X не является активным", row: 2 }] }]);
+  const result = await call("cats_release", { pernr: "12345", counters: ["1", "2"] });
+  assert.equal(JSON.parse(result.text.split("\n\n")[0]).committed, false);
+  assert.match(result.text, /Ошибка · строка 2: Проект X не является активным \(ZCATS001\)/);
+});
+
+test("cats_capacity: сообщения хендлера выводятся текстом, а не полем ответа", async () => {
+  replies.set("/capacity", [200, {
+    days: [{ date: "2027-01-01", is_workday: false, booked: 0, free: 0 }],
+    norm_hours: 8,
+    calendar: "BY",
+    total_free: 0,
+    messages: [{ type: "W", id: "MCP", number: 7, text: "Календарь не определил 1 дат(ы)", row: 0 }],
+  }]);
+  const result = await call("cats_capacity", { pernr: "12345", date_from: "2027-01-01", date_to: "2027-01-01" });
+  assert.equal(result.isError, undefined);
+  assert.equal(JSON.parse(result.text.split("\n\n")[0]).messages, undefined);
+  assert.match(result.text, /Предупреждение · Календарь не определил 1 дат\(ы\) \(MCP007\)/);
 });
 
 test("prompts: три сценария, аргументы подставляются в текст", async () => {
@@ -263,7 +340,17 @@ test("prompts: три сценария, аргументы подставляю�
   assert.match(text, /проектом PRJ01/);
   assert.match(text, /cats_capacity/);
   assert.match(text, /пока я не подтвердил/);
+  assert.match(text, /описание работ \(ext\.descr\) спроси у меня/);
   assert.doesNotMatch(text, /undefined/);
+
+  const withDescr = await client.getPrompt({
+    name: "fill_gaps",
+    arguments: { date_from: "2026-09-01", date_to: "2026-09-30", prjct: "PRJ01", descr: "Сопровождение" },
+  });
+  assert.match(withDescr.messages[0].content.text, /в ext\.descr — «Сопровождение»/);
+
+  const week = await client.getPrompt({ name: "fill_week_like_last", arguments: { week_start: "2026-09-28" } });
+  assert.match(week.messages[0].content.text, /статусах 50 и 60/);
 });
 
 test("prompts: без pernr — подсказка про cats_whoami", async () => {

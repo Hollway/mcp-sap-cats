@@ -31,6 +31,12 @@ CLASS ltc_handler DEFINITION FINAL
     METHODS change_tables_rows_match FOR TESTING.
     METHODS longtext_round_trip FOR TESTING.
     METHODS longtext_itf_formats FOR TESTING.
+    METHODS split_longtext_space_boundary FOR TESTING.
+    METHODS change_tables_keep_current FOR TESTING.
+    METHODS change_tables_new_receiver FOR TESTING.
+    METHODS to_bapi_te_catsdb_fields FOR TESTING.
+    METHODS limit_change_over_norm_day FOR TESTING.
+    METHODS limit_insert_counts_existing FOR TESTING.
 ENDCLASS.
 
 CLASS ltc_handler IMPLEMENTATION.
@@ -208,6 +214,99 @@ CLASS ltc_handler IMPLEMENTATION.
 
     cl_abap_unit_assert=>assert_equals( act = lv_text
                                         exp = |один дватри{ cl_abap_char_utilities=>newline }четыре| ).
+  ENDMETHOD.
+
+  METHOD split_longtext_space_boundary.
+    DATA(lv_text)  = |{ repeat( val = `а` occ = 131 ) } б|.
+    DATA(lt_lines) = cut->split_longtext( iv_row = 1 iv_text = lv_text ).
+
+    cl_abap_unit_assert=>assert_equals( act = lines( lt_lines ) exp = 2 ).
+    cl_abap_unit_assert=>assert_equals( act = cut->longtext_to_string( lt_lines ) exp = lv_text ).
+  ENDMETHOD.
+
+  METHOD change_tables_keep_current.
+    DATA(ls_tables) = cut->build_change_tables(
+      iv_pernr   = c_no_pernr
+      it_records = VALUE #( ( counter = '000000000001' workdate = c_no_date hours = 3 )
+                            ( counter = '000000000002' workdate = c_no_date hours = 1 shorttext = 'НОВЫЙ' start_time = `10:00` )
+                            ( counter = '000000000003' workdate = c_no_date hours = 2 ) )
+      it_current = VALUE #( ( counter = '000000000001' pernr = c_no_pernr hours = 1 unit = 'STD' wagetype = 'M200'
+                              shorttext = 'СТАРЫЙ' send_cctr = 'CC1' start_time = '090000' end_time = '100000' )
+                            ( counter = '000000000002' pernr = c_no_pernr hours = 2 shorttext = 'СТАРЫЙ' start_time = '090000' )
+                            ( counter = '000000000003' pernr = c_no_pernr hours = 2 start_time = '080000' end_time = '100000' ) ) ).
+
+    DATA(ls_first) = ls_tables-catsrecords[ 1 ].
+    cl_abap_unit_assert=>assert_equals( act = ls_first-catshours exp = 3 ).
+    cl_abap_unit_assert=>assert_equals( act = ls_first-wagetype exp = 'M200' ).
+    cl_abap_unit_assert=>assert_equals( act = ls_first-shorttext exp = 'СТАРЫЙ' ).
+    cl_abap_unit_assert=>assert_equals( act = ls_first-send_cctr exp = 'CC1' ).
+    cl_abap_unit_assert=>assert_initial( ls_first-starttime ).
+    cl_abap_unit_assert=>assert_initial( ls_first-endtime ).
+    cl_abap_unit_assert=>assert_equals( act = ls_first-longtext exp = abap_false ).
+
+    DATA(ls_second) = ls_tables-catsrecords[ 2 ].
+    cl_abap_unit_assert=>assert_equals( act = ls_second-shorttext exp = 'НОВЫЙ' ).
+    cl_abap_unit_assert=>assert_equals( act = ls_second-starttime exp = '100000' ).
+
+    DATA(ls_third) = ls_tables-catsrecords[ 3 ].
+    cl_abap_unit_assert=>assert_equals( act = ls_third-starttime exp = '080000' ).
+    cl_abap_unit_assert=>assert_equals( act = ls_third-endtime exp = '100000' ).
+  ENDMETHOD.
+
+  METHOD change_tables_new_receiver.
+    DATA(ls_tables) = cut->build_change_tables(
+      iv_pernr   = c_no_pernr
+      it_records = VALUE #( ( counter = '000000000001' workdate = c_no_date hours = 1 receiver = VALUE #( order = 'ORDER1' ) ) )
+      it_current = VALUE #( ( counter = '000000000001' rec_cctr = 'CC1' co_area = 'CA01' ) ) ).
+
+    cl_abap_unit_assert=>assert_equals( act = ls_tables-catsrecords[ 1 ]-rec_order exp = 'ORDER1' ).
+    cl_abap_unit_assert=>assert_initial( ls_tables-catsrecords[ 1 ]-rec_cctr ).
+    cl_abap_unit_assert=>assert_initial( ls_tables-catsrecords[ 1 ]-co_area ).
+  ENDMETHOD.
+
+  METHOD to_bapi_te_catsdb_fields.
+    DATA(ls_te) = VALUE bapi_te_catsdb( ).
+    ls_te = cut->to_bapi_te_catsdb( iv_row = 4
+                                     is_ext = VALUE #( prjct = 'P1' rqsnb = '00562' descr = 'Описание' orgunit = 'ОЕ1' ) ).
+
+    cl_abap_unit_assert=>assert_equals( act = ls_te-row exp = CONV char10( 4 ) ).
+    cl_abap_unit_assert=>assert_equals( act = ls_te-zzprjct exp = 'P1' ).
+    cl_abap_unit_assert=>assert_equals( act = ls_te-zzrqsnb exp = '00562' ).
+    cl_abap_unit_assert=>assert_equals( act = ls_te-zzdescr exp = 'Описание' ).
+    cl_abap_unit_assert=>assert_equals( act = ls_te-zzorgunit exp = 'ОЕ1' ).
+  ENDMETHOD.
+
+  METHOD limit_change_over_norm_day.
+    DATA(lt_rows)    = VALUE zcl_cats_mcp_handler=>tt_hours_row( ( counter = '000000000001' workdate = c_no_date hours = 6 )
+                                                               ( counter = '000000000002' workdate = c_no_date hours = 4 ) ).
+    DATA(lt_exclude) = VALUE zcl_cats_mcp_handler=>tt_counter( ( '000000000002' ) ).
+
+    cl_abap_unit_assert=>assert_initial( cut->daily_limit_messages( it_rows       = lt_rows
+                                                                    it_records    = VALUE #( ( workdate = c_no_date hours = 4 ) )
+                                                                    iv_norm_hours = 8
+                                                                    it_exclude    = lt_exclude ) ).
+    cl_abap_unit_assert=>assert_initial( cut->daily_limit_messages( it_rows       = lt_rows
+                                                                    it_records    = VALUE #( ( workdate = c_no_date hours = 3 ) )
+                                                                    iv_norm_hours = 8
+                                                                    it_exclude    = lt_exclude ) ).
+    cl_abap_unit_assert=>assert_equals(
+      act = lines( cut->daily_limit_messages( it_rows       = lt_rows
+                                              it_records    = VALUE #( ( workdate = c_no_date hours = 5 ) )
+                                              iv_norm_hours = 8
+                                              it_exclude    = lt_exclude ) )
+      exp = 1 ).
+  ENDMETHOD.
+
+  METHOD limit_insert_counts_existing.
+    DATA(lt_return) = cut->daily_limit_messages(
+      it_rows       = VALUE #( ( counter = '000000000001' workdate = c_no_date hours = 6 )
+                               ( counter = '000000000002' workdate = c_no_date - 1 hours = 7 ) )
+      it_records    = VALUE #( ( workdate = c_no_date hours = 3 )
+                               ( workdate = c_no_date - 1 hours = 1 ) )
+      iv_norm_hours = 8 ).
+
+    cl_abap_unit_assert=>assert_equals( act = lines( lt_return ) exp = 1 ).
+    cl_abap_unit_assert=>assert_char_cp( act = lt_return[ 1 ]-message exp = '*уже 6.00 + новые 3.00 = 9.00*' ).
   ENDMETHOD.
 
 ENDCLASS.

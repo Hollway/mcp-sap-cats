@@ -16,10 +16,28 @@ export const pernr = z
   .regex(/^\d{1,8}$/)
   .describe("Табельный номер, до 8 цифр");
 
+/**
+ * Несуществующая дата (2026-02-30) уходит в поле типа d как есть, и ABAP
+ * считает её нулевой: цикл /capacity тогда начинается с 0001-01-02.
+ */
 export const isoDate = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/)
+  .refine(
+    (v) => {
+      const date = new Date(`${v}T00:00:00Z`);
+      return !Number.isNaN(date.getTime()) && date.toISOString().startsWith(v);
+    },
+    { message: "Такой даты нет в календаре" },
+  )
   .describe("Дата в формате YYYY-MM-DD");
+
+/** CATSDB-COUNTER — CHAR 12 с ведущими нулями: «388371» без них не найдёт ни одной записи. */
+export const counter = z
+  .string()
+  .regex(/^\d{1,12}$/)
+  .transform((v) => v.padStart(12, "0"))
+  .describe("Ключ записи CATSDB (counter из cats_read), ведущие нули можно опустить");
 
 export const profile = z
   .enum(CATS_PROFILES)
@@ -67,7 +85,7 @@ export const ytrKey = z
  */
 export const extFields = z
   .object({
-    rqsnb: z.string().regex(/^\d{1,5}$/).optional().describe("Номер ТЗ"),
+    rqsnb: z.string().regex(/^\d{0,5}$/).optional().describe("Номер ТЗ; пусто или 0 — номера нет"),
     prjct: z.string().max(30).optional().describe("Проект; можно не указывать, если задан ytr_key"),
     ytr_key: ytrKey.optional().describe("Ключ задачи в Трекере вместо пары prjct + rqsnb"),
     descr: z
@@ -79,14 +97,14 @@ export const extFields = z
   })
   .strict()
   .refine((e) => e.prjct || e.ytr_key, { message: "Нужен ext.prjct или ext.ytr_key" })
-  .refine((e) => e.rqsnb || e.ytr_key || e.descr, {
+  .refine((e) => Number(e.rqsnb) > 0 || e.ytr_key || e.descr?.trim(), {
     message: "Без номера ТЗ описание работ (ext.descr) обязательно — в CAT2 его вводят вручную",
   });
 
 export const catsRecord = z
   .object({
     workdate: isoDate,
-    hours: z.number().positive().multipleOf(0.25),
+    hours: z.number().positive().max(24).multipleOf(0.25),
     receiver: receiver.optional().describe("Объект отнесения — не обязателен, реальные записи его не используют"),
     unit: z.string().max(3).default("STD"),
     wagetype: z.string().max(4).default("M120"),
@@ -105,8 +123,14 @@ export const catsRecord = z
   })
   .strict();
 
+/**
+ * У правки нет значений по умолчанию для единицы и вида оплаты: пустое поле
+ * означает «оставить как в записи», а STD/M120 перезаписали бы записи из CAT2.
+ */
 export const catsRecordWithCounter = catsRecord.extend({
-  counter: z.string().max(12).describe("Ключ записи CATSDB"),
+  counter,
+  unit: z.string().max(3).optional().describe("Единица; если не указана, остаётся текущая"),
+  wagetype: z.string().max(4).optional().describe("Вид оплаты; если не указан, остаётся текущий"),
 });
 
 export type CatsRecord = z.infer<typeof catsRecord>;

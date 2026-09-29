@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { catsRecord, receiver } from "../dist/schemas.js";
-import { SapClient, SapError, formatMessages, hasErrors, isLocked } from "../dist/sap.js";
+import { catsRecord, catsRecordWithCounter, isoDate, receiver } from "../dist/schemas.js";
+import { SapClient, SapError, dotenvValue, envInt, formatMessages, hasErrors, isLocked } from "../dist/sap.js";
 
 const baseRecord = { workdate: "2026-09-21", hours: 2, ext: { prjct: "PRJ01", descr: "Работа" } };
 
@@ -19,17 +19,43 @@ test("catsRecord: нужен ext.prjct или ext.ytr_key (ZCATS001)", () => {
   assert.equal(catsRecord.safeParse({ workdate: "2026-09-21", hours: 2 }).success, false);
 });
 
-test("catsRecord: часы — положительные, шаг 0,25", () => {
+test("catsRecord: часы — положительные, не больше 24, шаг 0,25", () => {
   assert.equal(catsRecord.safeParse({ ...baseRecord, hours: 1.25 }).success, true);
   assert.equal(catsRecord.safeParse({ ...baseRecord, hours: 1.3 }).success, false);
   assert.equal(catsRecord.safeParse({ ...baseRecord, hours: 0 }).success, false);
   assert.equal(catsRecord.safeParse({ ...baseRecord, hours: -1 }).success, false);
+  assert.equal(catsRecord.safeParse({ ...baseRecord, hours: 24 }).success, true);
+  assert.equal(catsRecord.safeParse({ ...baseRecord, hours: 24.25 }).success, false);
 });
 
 test("catsRecord: формат даты и времени", () => {
   assert.equal(catsRecord.safeParse({ ...baseRecord, workdate: "21.09.2026" }).success, false);
   assert.equal(catsRecord.safeParse({ ...baseRecord, start_time: "9:00" }).success, false);
   assert.equal(catsRecord.safeParse({ ...baseRecord, start_time: "09:00", end_time: "11:00" }).success, true);
+});
+
+test("isoDate: несуществующая дата отвергается, а не уходит в SAP нулём", () => {
+  for (const value of ["2026-02-29", "2026-02-30", "2026-04-31", "2026-13-01", "2026-00-10"]) {
+    assert.equal(isoDate.safeParse(value).success, false, value);
+  }
+  for (const value of ["2024-02-29", "2026-12-31", "2026-01-01"]) {
+    assert.equal(isoDate.safeParse(value).success, true, value);
+  }
+});
+
+test("counter: ведущие нули дополняются до 12 знаков, нецифры отвергаются", () => {
+  const parsed = catsRecordWithCounter.parse({ ...baseRecord, counter: "388371" });
+  assert.equal(parsed.counter, "000000388371");
+  assert.equal(catsRecordWithCounter.parse({ ...baseRecord, counter: "000000388371" }).counter, "000000388371");
+  assert.equal(catsRecordWithCounter.safeParse({ ...baseRecord, counter: "abc" }).success, false);
+  assert.equal(catsRecordWithCounter.safeParse({ ...baseRecord, counter: "1234567890123" }).success, false);
+});
+
+test("catsRecordWithCounter: без умолчаний для unit и wagetype — пустое значит «оставить как в записи»", () => {
+  const parsed = catsRecordWithCounter.parse({ ...baseRecord, counter: "1" });
+  assert.equal(parsed.unit, undefined);
+  assert.equal(parsed.wagetype, undefined);
+  assert.equal(catsRecord.parse(baseRecord).wagetype, "M120");
 });
 
 test("catsRecord: longtext необязателен и ограничен 4000 символами", () => {
@@ -40,6 +66,16 @@ test("catsRecord: longtext необязателен и ограничен 4000 �
 test("catsRecord: без номера ТЗ описание обязательно, с номером — нет", () => {
   assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { prjct: "PRJ01" } }).success, false);
   assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { prjct: "PRJ01", rqsnb: "562" } }).success, true);
+});
+
+test("catsRecord: номер ТЗ из одних нулей — это «номера нет», описание обязательно", () => {
+  for (const rqsnb of ["0", "00000"]) {
+    assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { prjct: "PRJ01", rqsnb } }).success, false, rqsnb);
+    assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { prjct: "PRJ01", rqsnb, descr: "Работа" } }).success, true, rqsnb);
+  }
+  assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { prjct: "PRJ01", descr: "   " } }).success, false);
+  assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { prjct: "PRJ01", rqsnb: "", descr: "Работа" } }).success, true, "пустой rqsnb из cats_read");
+  assert.equal(catsRecord.safeParse({ ...baseRecord, ext: { prjct: "PRJ01", rqsnb: "" } }).success, false);
 });
 
 test("catsRecord: неизвестные поля отвергаются", () => {
@@ -62,10 +98,41 @@ test("formatMessages: row 0 и отсутствующий row — сообщен
   ]);
   assert.deepEqual(text.split("\n"), [
     "Ошибка · Несколько табельных (LR199)",
-    "Успешно · Уже создано (MCP1)",
+    "Успешно · Уже создано (MCP001)",
     "Предупреждение · строка 2: Строка (KI101)",
   ]);
   assert.equal(formatMessages([]), "");
+});
+
+test("formatMessages: NUMC-номер, пришедший числом, — в виде SE91 (LR002)", () => {
+  assert.equal(formatMessages([{ type: "E", id: "LR", number: 2, text: "Блокировка" }]), "Ошибка · Блокировка (LR002)");
+});
+
+test("dotenvValue: кавычки снимаются, « #» без кавычек — комментарий, # внутри значения остаётся", () => {
+  assert.equal(dotenvValue('"Pa#ss word"'), "Pa#ss word");
+  assert.equal(dotenvValue("'a b'"), "a b");
+  assert.equal(dotenvValue("102 # мандант"), "102");
+  assert.equal(dotenvValue("Pa#ss"), "Pa#ss");
+  assert.equal(dotenvValue('"'), '"');
+  assert.equal(dotenvValue(""), "");
+});
+
+test("envInt: пусто — умолчание, опечатка — ошибка запуска, а не NaN", () => {
+  const name = "SAP_CATS_TEST_INT";
+  try {
+    delete process.env[name];
+    assert.equal(envInt(name, 5, 0, 10), 5);
+    process.env[name] = " ";
+    assert.equal(envInt(name, 5, 0, 10), 5);
+    process.env[name] = "7";
+    assert.equal(envInt(name, 5, 0, 10), 7);
+    for (const bad of ["2 # повторы", "abc", "1.5", "-1", "11"]) {
+      process.env[name] = bad;
+      assert.throws(() => envInt(name, 5, 0, 10), new RegExp(name), bad);
+    }
+  } finally {
+    delete process.env[name];
+  }
 });
 
 test("hasErrors: E и A — ошибки, остальное нет", () => {
@@ -81,6 +148,7 @@ const cfg = {
   user: "u",
   password: "p",
   profile: "TIME_D1",
+  language: "",
   timeoutMs: 1_000,
   lockRetries: 2,
   lockRetryDelayMs: 1,
@@ -193,6 +261,76 @@ test("SapClient: таймаут превращается в SapError с подс
         return true;
       });
     },
+  ));
+
+test("SapClient: SAP_LANGUAGE уходит в sap-language", () =>
+  withFetch(
+    async (url) => {
+      assert.equal(new URL(String(url)).searchParams.get("sap-language"), "RU");
+      return new Response("{}", { status: 200 });
+    },
+    () => new SapClient({ ...cfg, language: "RU" }).call("/read", "POST", {}),
+  ));
+
+test("SapClient: ответ не JSON (страница входа) — SapError, у записи — с подсказкой про повтор", () =>
+  withFetch(
+    async () => new Response("<html>logon</html>", { status: 200 }),
+    async () => {
+      await assert.rejects(new SapClient(cfg).call("/read", "POST", {}), (error) => {
+        assert.ok(error instanceof SapError);
+        assert.match(error.message, /не JSON/);
+        assert.doesNotMatch(error.message, /idempotency_key/);
+        return true;
+      });
+      await assert.rejects(new SapClient(cfg).call("/insert", "POST", {}), /idempotency_key/);
+    },
+  ));
+
+test("SapClient: сетевая ошибка — код из cause и подсказка по его виду", () => {
+  const failWith = (code) => async () => {
+    throw Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error(code.toLowerCase()), { code }) });
+  };
+  return (async () => {
+    await withFetch(failWith("UNABLE_TO_VERIFY_LEAF_SIGNATURE"), () =>
+      assert.rejects(new SapClient(cfg).call("/insert", "POST", {}), (error) => {
+        assert.ok(error instanceof SapError);
+        assert.match(error.message, /UNABLE_TO_VERIFY_LEAF_SIGNATURE/);
+        assert.match(error.message, /NODE_EXTRA_CA_CERTS/);
+        assert.doesNotMatch(error.message, /неизвестен/);
+        return true;
+      }),
+    );
+    await withFetch(failWith("ENOTFOUND"), () => assert.rejects(new SapClient(cfg).call("/read", "POST", {}), /SAP_CATS_URL/));
+    await withFetch(failWith("UND_ERR_SOCKET"), () => assert.rejects(new SapClient(cfg).call("/change", "POST", {}), /неизвестен/));
+    await withFetch(failWith("ETIMEDOUT"), () => assert.rejects(new SapClient(cfg).call("/insert", "POST", {}), /неизвестен/));
+    await withFetch(failWith("ECONNREFUSED"), () =>
+      assert.rejects(new SapClient(cfg).call("/insert", "POST", {}), (error) => !/неизвестен/.test(error.message)),
+    );
+    await withFetch(failWith("UND_ERR_SOCKET"), () =>
+      assert.rejects(new SapClient(cfg).call("/read", "POST", {}), (error) => !/неизвестен/.test(error.message)),
+    );
+  })();
+});
+
+test("SapClient: таймаут на чтении тела — тот же SapError, что и таймаут соединения", () =>
+  withFetch(
+    async (url, init) =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("{"));
+            init.signal.addEventListener("abort", () => controller.error(init.signal.reason));
+          },
+        }),
+        { status: 200 },
+      ),
+    () =>
+      assert.rejects(new SapClient({ ...cfg, timeoutMs: 50 }).call("/insert", "POST", {}), (error) => {
+        assert.ok(error instanceof SapError);
+        assert.match(error.message, /не ответил за 0.05 с/);
+        assert.match(error.message, /idempotency_key/);
+        return true;
+      }),
   ));
 
 test("summarize: группы проект + ТЗ, без ТЗ — по описанию, статусы 50 и 60 не считаются", async () => {

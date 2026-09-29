@@ -8,6 +8,8 @@ public section.
   interfaces IF_HTTP_EXTENSION .
   PRIVATE SECTION.
     TYPES:
+      ty_hours_sum TYPE p LENGTH 8 DECIMALS 2,
+
       BEGIN OF ts_cats_row,
         counter       TYPE catsdb-counter,
         workdate      TYPE catsdb-workdate,
@@ -46,7 +48,7 @@ public section.
 
       BEGIN OF ts_read_response,
         rows        TYPE tt_cats_row,
-        total_hours TYPE catsdb-catshours,
+        total_hours TYPE ty_hours_sum,
         messages    TYPE tt_message,
       END OF ts_read_response,
 
@@ -234,6 +236,7 @@ public section.
         descr      TYPE catsdb-zzdescr,
         orgunit    TYPE catsdb-zzorgunit,
         longtext   TYPE catsdb-longtext,
+        status     TYPE catsdb-status,
       END OF ts_catsdb_full,
       tt_catsdb_full TYPE STANDARD TABLE OF ts_catsdb_full WITH EMPTY KEY,
       tt_counter_range TYPE RANGE OF catsdb-counter,
@@ -278,7 +281,8 @@ public section.
         days       TYPE tt_capacity_day,
         norm_hours TYPE catsdb-catshours,
         calendar   TYPE scal-fcalid,
-        total_free TYPE catsdb-catshours,
+        total_free TYPE ty_hours_sum,
+        messages   TYPE tt_message,
       END OF ts_capacity_response,
 
       tt_workdate_range TYPE RANGE OF catsdb-workdate,
@@ -439,7 +443,24 @@ public section.
     METHODS build_change_tables
       IMPORTING iv_pernr         TYPE catsdb-pernr
                 it_records       TYPE tt_change_record_in
+                it_current       TYPE tt_catsdb_full OPTIONAL
       RETURNING VALUE(rs_tables) TYPE ts_change_tables.
+
+    METHODS daily_limit_messages
+      IMPORTING it_rows          TYPE tt_hours_row
+                it_records       TYPE tt_record_in
+                iv_norm_hours    TYPE catsdb-catshours
+                it_exclude       TYPE tt_counter OPTIONAL
+      RETURNING VALUE(rt_return) TYPE tt_bapiret2.
+
+    METHODS select_rows
+      IMPORTING iv_pernr       TYPE catsdb-pernr
+                it_counters    TYPE tt_counter
+      RETURNING VALUE(rt_rows) TYPE tt_catsdb_full.
+
+    METHODS row_to_bapicats3
+      IMPORTING is_row              TYPE ts_catsdb_full
+      RETURNING VALUE(rs_bapicats3) TYPE bapicats3.
 ENDCLASS.
 
 
@@ -449,27 +470,60 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
 
   METHOD build_change_tables.
     LOOP AT it_records INTO DATA(ls_record).
-      DATA(ls_bapicats3) = VALUE bapicats3( counter        = ls_record-counter
-                                             workdate       = ls_record-workdate
-                                             employeenumber = iv_pernr
-                                             catshours      = ls_record-hours
-                                             unit           = ls_record-unit
-                                             wagetype       = ls_record-wagetype
-                                             acttype        = ls_record-acttype
-                                             send_cctr      = ls_record-send_cctr
-                                             shorttext      = ls_record-shorttext
-                                             abs_att_type   = ls_record-attendance_type
-                                             starttime      = time_from_hhmm( ls_record-start_time )
-                                             endtime        = time_from_hhmm( ls_record-end_time )
-                                             longtext       = xsdbool( ls_record-longtext IS NOT INITIAL ) ).
+      DATA(ls_current)   = VALUE ts_catsdb_full( it_current[ counter = ls_record-counter ] OPTIONAL ).
+      DATA(ls_bapicats3) = row_to_bapicats3( ls_current ).
 
-      map_receiver_bapicats3( EXPORTING is_receiver  = ls_record-receiver
-                               CHANGING  cs_bapicats3 = ls_bapicats3 ).
+      ls_bapicats3-counter        = ls_record-counter.
+      ls_bapicats3-workdate       = ls_record-workdate.
+      ls_bapicats3-employeenumber = iv_pernr.
+      ls_bapicats3-catshours      = ls_record-hours.
+
+      IF ls_record-unit IS NOT INITIAL.
+        ls_bapicats3-unit = ls_record-unit.
+      ENDIF.
+      IF ls_record-wagetype IS NOT INITIAL.
+        ls_bapicats3-wagetype = ls_record-wagetype.
+      ENDIF.
+      IF ls_record-acttype IS NOT INITIAL.
+        ls_bapicats3-acttype = ls_record-acttype.
+      ENDIF.
+      IF ls_record-send_cctr IS NOT INITIAL.
+        ls_bapicats3-send_cctr = ls_record-send_cctr.
+      ENDIF.
+      IF ls_record-shorttext IS NOT INITIAL.
+        ls_bapicats3-shorttext = ls_record-shorttext.
+      ENDIF.
+      IF ls_record-attendance_type IS NOT INITIAL.
+        ls_bapicats3-abs_att_type = ls_record-attendance_type.
+      ENDIF.
+      IF ls_record-start_time IS NOT INITIAL.
+        ls_bapicats3-starttime = time_from_hhmm( ls_record-start_time ).
+      ENDIF.
+      IF ls_record-end_time IS NOT INITIAL.
+        ls_bapicats3-endtime = time_from_hhmm( ls_record-end_time ).
+      ENDIF.
+      IF ls_record-start_time IS INITIAL AND ls_record-end_time IS INITIAL AND ls_record-hours <> ls_current-hours.
+        CLEAR: ls_bapicats3-starttime, ls_bapicats3-endtime.
+      ENDIF.
+      IF ls_record-receiver IS NOT INITIAL.
+        CLEAR: ls_bapicats3-rec_cctr, ls_bapicats3-co_area, ls_bapicats3-rec_order,
+               ls_bapicats3-recsaleord, ls_bapicats3-recitem, ls_bapicats3-po_number, ls_bapicats3-po_item,
+               ls_bapicats3-wbs_element, ls_bapicats3-network, ls_bapicats3-activity, ls_bapicats3-sub_activity.
+        map_receiver_bapicats3( EXPORTING is_receiver  = ls_record-receiver
+                                 CHANGING  cs_bapicats3 = ls_bapicats3 ).
+      ENDIF.
+
+      DATA(lv_row)  = lines( rs_tables-catsrecords ) + 1.
+      DATA(lt_text) = COND tt_bapicats8( WHEN ls_record-longtext IS NOT INITIAL
+                                          THEN split_longtext( iv_row  = lv_row
+                                                               iv_text = ls_record-longtext )
+                                          WHEN ls_current-longtext = abap_true
+                                          THEN read_longtext( iv_row     = lv_row
+                                                              iv_counter = ls_current-counter ) ).
+      ls_bapicats3-longtext = xsdbool( lt_text IS NOT INITIAL ).
 
       APPEND ls_bapicats3 TO rs_tables-catsrecords.
-      DATA(lv_row) = lines( rs_tables-catsrecords ).
-      APPEND LINES OF split_longtext( iv_row  = lv_row
-                                      iv_text = ls_record-longtext ) TO rs_tables-longtext.
+      APPEND LINES OF lt_text TO rs_tables-longtext.
 
       APPEND VALUE bapicats7( structure  = 'BAPI_TE_CATSDB'
                                valuepart1 = to_bapi_te_catsdb( iv_row = lv_row
@@ -519,6 +573,25 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
   METHOD check_daily_limit.
     CHECK it_records IS NOT INITIAL.
 
+    DATA(lt_date_range) = VALUE tt_workdate_range( FOR ls_range_record IN it_records
+                                                    ( sign = 'I' option = 'EQ' low = ls_range_record-workdate ) ).
+
+    DATA(lt_rows) = VALUE tt_hours_row( ).
+    SELECT counter, workdate, catshours AS hours
+      FROM catsdb
+      WHERE pernr = @iv_pernr
+        AND workdate IN @lt_date_range
+        AND status NOT IN ( @c_status_changed, @c_status_cancelled )
+      INTO TABLE @lt_rows.
+
+    rt_return = daily_limit_messages( it_rows       = lt_rows
+                                      it_records    = it_records
+                                      iv_norm_hours = iv_norm_hours
+                                      it_exclude    = it_exclude ).
+  ENDMETHOD.
+
+
+  METHOD daily_limit_messages.
     DATA(lt_new_by_day) = VALUE tt_booked_day( ).
     LOOP AT it_records INTO DATA(ls_record).
       READ TABLE lt_new_by_day WITH KEY workdate = ls_record-workdate ASSIGNING FIELD-SYMBOL(<ls_new_day>).
@@ -529,26 +602,18 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       ENDIF.
     ENDLOOP.
 
-    DATA(lt_date_range) = VALUE tt_workdate_range( FOR ls_range_day IN lt_new_by_day
-                                                    ( sign = 'I' option = 'EQ' low = ls_range_day-workdate ) ).
-
-    DATA(lt_rows) = VALUE tt_hours_row( ).
-    SELECT counter, workdate, catshours AS hours
-      FROM catsdb
-      WHERE pernr = @iv_pernr
-        AND workdate IN @lt_date_range
-        AND status NOT IN ( @c_status_changed, @c_status_cancelled )
-      INTO TABLE @lt_rows.
-
     LOOP AT lt_new_by_day INTO DATA(ls_new_day).
+      DATA(lv_before)   = REDUCE catsdb-catshours( INIT sum TYPE catsdb-catshours
+                                                    FOR ls_row IN it_rows WHERE ( workdate = ls_new_day-workdate )
+                                                    NEXT sum = sum + ls_row-hours ).
       DATA(lv_existing) = REDUCE catsdb-catshours( INIT sum TYPE catsdb-catshours
-                                                    FOR ls_row IN lt_rows WHERE ( workdate = ls_new_day-workdate )
+                                                    FOR ls_row IN it_rows WHERE ( workdate = ls_new_day-workdate )
                                                     NEXT sum = sum + COND catsdb-catshours( WHEN line_exists( it_exclude[ table_line = ls_row-counter ] )
                                                                                             THEN 0
                                                                                             ELSE ls_row-hours ) ).
       DATA(lv_total)    = lv_existing + ls_new_day-hours.
 
-      IF lv_total > iv_norm_hours.
+      IF lv_total > iv_norm_hours AND lv_total > lv_before.
         APPEND VALUE bapiret2( type    = 'E'
                                 id      = 'MCP'
                                 number  = '002'
@@ -567,6 +632,15 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
 
   METHOD if_http_extension~handle_request.
     DATA(lv_path) = server->request->get_header_field( name = '~path_info' ).
+
+    IF server->request->get_method( ) <> 'POST'.
+      send_error( server = server code = 405 message = |Разрешён только POST| ).
+      RETURN.
+    ENDIF.
+    IF server->request->get_header_field( name = 'content-type' ) NP 'application/json*'.
+      send_error( server = server code = 415 message = |Нужен Content-Type: application/json| ).
+      RETURN.
+    ENDIF.
 
     TRY.
         CASE lv_path.
@@ -672,12 +746,15 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
 
   METHOD read_longtext.
     DATA(lv_language) = VALUE stxh-tdspras( ).
-    SELECT SINGLE tdspras
+    SELECT tdspras
       FROM stxh
       WHERE tdobject = 'CATS'
         AND tdid     = 'CATS'
         AND tdname   = @iv_counter
-      INTO @lv_language.
+      ORDER BY tdldate DESCENDING, tdltime DESCENDING
+      INTO @lv_language
+      UP TO 1 ROWS.
+    ENDSELECT.
     CHECK sy-subrc = 0.
 
     DATA(lt_lines) = VALUE tline_tab( ).
@@ -709,6 +786,13 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       CHANGING
         data        = ls_request ).
 
+    IF ls_request-date_from IS INITIAL
+       OR ls_request-date_from > ls_request-date_to
+       OR ls_request-date_to - ls_request-date_from > 3660.
+      send_error( server = server code = 400 message = |Некорректный период { ls_request-date_from DATE = ISO } – { ls_request-date_to DATE = ISO }| ).
+      RETURN.
+    ENDIF.
+
     DATA(lt_booked) = VALUE tt_booked_day( ).
     SELECT workdate, SUM( catshours ) AS hours
       FROM catsdb
@@ -719,8 +803,10 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       INTO TABLE @lt_booked.
 
     DATA(lt_days)       = VALUE tt_capacity_day( ).
-    DATA(lv_total_free) = VALUE catsdb-catshours( ).
+    DATA(lv_total_free) = VALUE ty_hours_sum( ).
     DATA(lv_date)       = ls_request-date_from.
+    DATA(lv_no_calendar) = 0.
+    DATA(lv_first_no_calendar) = VALUE catsdb-workdate( ).
 
     WHILE lv_date <= ls_request-date_to.
       DATA(lv_flag) = VALUE scal-indicator( ).
@@ -737,7 +823,15 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
           factory_calendar_not_found = 4
           OTHERS                     = 5.
 
-      DATA(lv_is_workday) = xsdbool( sy-subrc = 0 AND lv_flag = space ).
+      DATA(lv_calendar_rc) = sy-subrc.
+      IF lv_calendar_rc <> 0.
+        lv_no_calendar = lv_no_calendar + 1.
+        IF lv_first_no_calendar IS INITIAL.
+          lv_first_no_calendar = lv_date.
+        ENDIF.
+      ENDIF.
+
+      DATA(lv_is_workday) = xsdbool( lv_calendar_rc = 0 AND lv_flag = space ).
       DATA(lv_booked)     = VALUE catsdb-catshours( lt_booked[ workdate = lv_date ]-hours OPTIONAL ).
       DATA(lv_norm)       = COND catsdb-catshours( WHEN lv_is_workday = abap_true THEN ls_request-norm_hours ELSE 0 ).
       DATA(lv_free)       = lv_norm - lv_booked.
@@ -756,6 +850,11 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
                                                       norm_hours = ls_request-norm_hours
                                                       calendar   = c_calendar
                                                       total_free = lv_total_free ).
+    IF lv_no_calendar > 0.
+      ls_response-messages = VALUE #( ( type = 'W' id = 'MCP' number = '007'
+                                        text = |Фабричный календарь { c_calendar } не определил { lv_no_calendar } дат(ы), | &&
+                                               |первая { lv_first_no_calendar DATE = ISO }: они показаны нерабочими| ) ).
+    ENDIF.
 
     DATA(lv_json) = /ui2/cl_json=>serialize( data        = ls_response
                                               pretty_name = /ui2/cl_json=>pretty_mode-low_case ).
@@ -774,10 +873,27 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       CHANGING
         data        = ls_request ).
 
+    DATA(lt_current) = select_rows( iv_pernr    = ls_request-pernr
+                                    it_counters = VALUE #( FOR ls_changed IN ls_request-records ( ls_changed-counter ) ) ).
+
     DATA(ls_tables)          = build_change_tables( iv_pernr   = ls_request-pernr
-                                                    it_records = ls_request-records ).
+                                                    it_records = ls_request-records
+                                                    it_current = lt_current ).
     DATA(lt_catsrecords_out) = VALUE tt_bapicats2( ).
     DATA(lt_return)          = VALUE tt_bapiret2( ).
+
+    DATA(lt_missing_return) = VALUE tt_bapiret2( ).
+    LOOP AT ls_request-records INTO DATA(ls_requested).
+      DATA(lv_record_idx) = sy-tabix.
+      IF NOT line_exists( lt_current[ counter = ls_requested-counter ] ).
+        APPEND VALUE bapiret2( type    = 'E'
+                                id      = 'MCP'
+                                number  = '006'
+                                row     = lv_record_idx
+                                message = |Запись { ls_requested-counter } не найдена у табельного { ls_request-pernr }| )
+               TO lt_missing_return.
+      ENDIF.
+    ENDLOOP.
 
     DATA(lt_limit_return) = check_daily_limit(
       iv_pernr      = ls_request-pernr
@@ -798,6 +914,7 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
         longtext        = ls_tables-longtext
         return          = lt_return.
 
+    APPEND LINES OF lt_missing_return TO lt_return.
     APPEND LINES OF lt_limit_return TO lt_return.
 
     DATA(lv_committed) = abap_false.
@@ -1105,7 +1222,7 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
                                                                   iv_counter = <ls_row>-counter ) ).
     ENDLOOP.
 
-    DATA(lv_total) = REDUCE catshours( INIT sum TYPE catshours
+    DATA(lv_total) = REDUCE ty_hours_sum( INIT sum TYPE ty_hours_sum
                                         FOR row IN lt_rows WHERE ( status <> c_status_changed AND status <> c_status_cancelled )
                                         NEXT sum = sum + row-hours ).
 
@@ -1131,27 +1248,18 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
         data        = ls_request ).
 
     DATA(lt_rows) = VALUE tt_catsdb_full( ).
-    DATA(lt_counter_range) = VALUE tt_counter_range( FOR lv_c IN ls_request-counters
-                                                      ( sign = 'I' option = 'EQ' low = lv_c ) ).
 
     IF ls_request-counters IS NOT INITIAL.
-      SELECT counter, workdate, pernr,
-             catshours AS hours, meinh AS unit, lgart AS wagetype, lstar AS acttype,
-             skostl AS send_cctr, rkostl AS rec_cctr, kokrs AS co_area, raufnr AS rec_order,
-             rkdauf AS sales_ord, rkdpos AS sales_item, sebeln AS po_number, sebelp AS po_item,
-             ltxa1 AS shorttext, awart AS att_type, beguz AS start_time, enduz AS end_time,
-             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit, longtext
-        FROM catsdb
-        WHERE counter IN @lt_counter_range
-          AND status = '10'
-        INTO TABLE @lt_rows.
+      lt_rows = select_rows( iv_pernr    = ls_request-pernr
+                             it_counters = ls_request-counters ).
+      DELETE lt_rows WHERE status <> '10'.
     ELSE.
       SELECT counter, workdate, pernr,
              catshours AS hours, meinh AS unit, lgart AS wagetype, lstar AS acttype,
              skostl AS send_cctr, rkostl AS rec_cctr, kokrs AS co_area, raufnr AS rec_order,
              rkdauf AS sales_ord, rkdpos AS sales_item, sebeln AS po_number, sebelp AS po_item,
              ltxa1 AS shorttext, awart AS att_type, beguz AS start_time, enduz AS end_time,
-             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit, longtext
+             zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit, longtext, status
         FROM catsdb
         WHERE pernr = @ls_request-pernr
           AND workdate BETWEEN @ls_request-date_from AND @ls_request-date_to
@@ -1166,27 +1274,7 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
     DATA(lt_return)          = VALUE tt_bapiret2( ).
 
     LOOP AT lt_rows INTO DATA(ls_row).
-      APPEND VALUE bapicats3( counter        = ls_row-counter
-                              workdate       = ls_row-workdate
-                              employeenumber = ls_row-pernr
-                              catshours      = ls_row-hours
-                              unit           = ls_row-unit
-                              wagetype       = ls_row-wagetype
-                              acttype        = ls_row-acttype
-                              send_cctr      = ls_row-send_cctr
-                              rec_cctr       = ls_row-rec_cctr
-                              co_area        = ls_row-co_area
-                              rec_order      = ls_row-rec_order
-                              recsaleord     = ls_row-sales_ord
-                              recitem        = ls_row-sales_item
-                              po_number      = ls_row-po_number
-                              po_item        = ls_row-po_item
-                              shorttext      = ls_row-shorttext
-                              abs_att_type   = ls_row-att_type
-                              starttime      = ls_row-start_time
-                              endtime        = ls_row-end_time
-                              longtext       = ls_row-longtext )
-             TO lt_catsrecords_in.
+      APPEND row_to_bapicats3( ls_row ) TO lt_catsrecords_in.
       DATA(lv_row) = lines( lt_catsrecords_in ).
 
       IF ls_row-longtext = abap_true.
@@ -1227,9 +1315,11 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       ENDIF.
     ENDIF.
 
-    DATA(lt_released) = VALUE tt_released_row(
-      FOR ls_out IN lt_catsrecords_out INDEX INTO lv_idx
-      ( row = lv_idx counter = ls_out-counter workdate = ls_out-workdate status = ls_out-status ) ).
+    DATA(lt_released) = VALUE tt_released_row( ).
+    IF lv_committed = abap_true.
+      lt_released = VALUE #( FOR ls_out IN lt_catsrecords_out INDEX INTO lv_idx
+                             ( row = lv_idx counter = ls_out-counter workdate = ls_out-workdate status = ls_out-status ) ).
+    ENDIF.
 
     DATA(ls_response) = VALUE ts_release_response( released  = lt_released
                                                      committed = lv_committed
@@ -1322,9 +1412,55 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
   ENDMETHOD.
 
 
+  METHOD row_to_bapicats3.
+    rs_bapicats3 = VALUE #( counter        = is_row-counter
+                            workdate       = is_row-workdate
+                            employeenumber = is_row-pernr
+                            catshours      = is_row-hours
+                            unit           = is_row-unit
+                            wagetype       = is_row-wagetype
+                            acttype        = is_row-acttype
+                            send_cctr      = is_row-send_cctr
+                            rec_cctr       = is_row-rec_cctr
+                            co_area        = is_row-co_area
+                            rec_order      = is_row-rec_order
+                            recsaleord     = is_row-sales_ord
+                            recitem        = is_row-sales_item
+                            po_number      = is_row-po_number
+                            po_item        = is_row-po_item
+                            shorttext      = is_row-shorttext
+                            abs_att_type   = is_row-att_type
+                            starttime      = is_row-start_time
+                            endtime        = is_row-end_time
+                            longtext       = is_row-longtext ).
+  ENDMETHOD.
+
+
+  METHOD select_rows.
+    CHECK it_counters IS NOT INITIAL.
+
+    DATA(lt_counter_range) = VALUE tt_counter_range( FOR lv_c IN it_counters
+                                                      ( sign = 'I' option = 'EQ' low = lv_c ) ).
+
+    SELECT counter, workdate, pernr,
+           catshours AS hours, meinh AS unit, lgart AS wagetype, lstar AS acttype,
+           skostl AS send_cctr, rkostl AS rec_cctr, kokrs AS co_area, raufnr AS rec_order,
+           rkdauf AS sales_ord, rkdpos AS sales_item, sebeln AS po_number, sebelp AS po_item,
+           ltxa1 AS shorttext, awart AS att_type, beguz AS start_time, enduz AS end_time,
+           zzrqsnb AS rqsnb, zzprjct AS prjct, zzdescr AS descr, zzorgunit AS orgunit, longtext, status
+      FROM catsdb
+      WHERE pernr = @iv_pernr
+        AND counter IN @lt_counter_range
+      INTO TABLE @rt_rows.
+  ENDMETHOD.
+
+
   METHOD send_error.
-    DATA(lv_json) = |\{"messages":[\{"type":"E","id":"MCP","number":"000","text":"{ message }"\}]\}|.
-    send_json( server = server code = code json = lv_json ).
+    DATA(ls_response) = VALUE ts_validate_response( messages = VALUE #( ( type = 'E' id = 'MCP' number = '000' text = message ) ) ).
+    send_json( server = server
+               code   = code
+               json   = /ui2/cl_json=>serialize( data        = ls_response
+                                                  pretty_name = /ui2/cl_json=>pretty_mode-low_case ) ).
   ENDMETHOD.
 
 
@@ -1345,6 +1481,9 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       DATA(lv_format) = CONV bapicats8-format_col( '*' ).
       DO.
         DATA(lv_len) = nmin( val1 = strlen( lv_rest ) val2 = 132 ).
+        WHILE lv_len > 1 AND lv_len < strlen( lv_rest ) AND substring( val = lv_rest off = lv_len - 1 len = 1 ) = ` `.
+          lv_len = lv_len - 1.
+        ENDWHILE.
         APPEND VALUE bapicats8( row        = iv_row
                                 format_col = lv_format
                                 text_line  = substring( val = lv_rest len = lv_len ) )
