@@ -434,6 +434,14 @@ public section.
       IMPORTING it_lines       TYPE tt_bapicats8
       RETURNING VALUE(rv_text) TYPE string.
 
+    METHODS escape_itf
+      IMPORTING iv_text         TYPE string
+      RETURNING VALUE(rt_units) TYPE string_table.
+
+    METHODS unescape_itf
+      IMPORTING iv_text        TYPE string
+      RETURNING VALUE(rv_text) TYPE string.
+
     METHODS build_insert_tables
       IMPORTING iv_pernr           TYPE catsdb-pernr
                 it_records         TYPE tt_record_in
@@ -691,7 +699,51 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
       ENDCASE.
     ENDLOOP.
 
-    rv_text = concat_lines_of( table = lt_paragraphs sep = cl_abap_char_utilities=>newline ).
+    rv_text = concat_lines_of( table = VALUE string_table( FOR lv_paragraph IN lt_paragraphs ( unescape_itf( lv_paragraph ) ) )
+                               sep   = cl_abap_char_utilities=>newline ).
+  ENDMETHOD.
+
+
+  METHOD escape_itf.
+    DATA(lv_tab) = CONV string( cl_abap_char_utilities=>horizontal_tab ).
+    DATA(lv_len) = strlen( iv_text ).
+
+    DO lv_len TIMES.
+      DATA(lv_off)  = sy-index - 1.
+      DATA(lv_char) = substring( val = iv_text off = lv_off len = 1 ).
+      DATA(lv_prev) = COND string( WHEN lv_off > 0 THEN substring( val = iv_text off = lv_off - 1 len = 1 ) ).
+      DATA(lv_next) = COND string( WHEN lv_off < lv_len - 1 THEN substring( val = iv_text off = lv_off + 1 len = 1 ) ).
+      APPEND COND string( WHEN lv_char = `<`    THEN `<(><<)>`
+                          WHEN lv_char = `&`    THEN `<(>&<)>`
+                          WHEN lv_char = lv_tab THEN `,,`
+                          WHEN lv_char = `,` AND ( lv_prev = `,` OR lv_prev = lv_tab OR lv_next = lv_tab ) THEN `<(>,<)>`
+                          ELSE lv_char )
+             TO rt_units.
+    ENDDO.
+  ENDMETHOD.
+
+
+  METHOD unescape_itf.
+    DATA(lv_off) = 0.
+    DATA(lv_len) = strlen( iv_text ).
+
+    WHILE lv_off < lv_len.
+      IF lv_len - lv_off >= 3 AND substring( val = iv_text off = lv_off len = 3 ) = `<(>`.
+        DATA(lv_close) = find( val = iv_text sub = `<)>` off = lv_off + 3 ).
+        IF lv_close < 0.
+          rv_text = rv_text && substring( val = iv_text off = lv_off ).
+          RETURN.
+        ENDIF.
+        rv_text = rv_text && substring( val = iv_text off = lv_off + 3 len = lv_close - lv_off - 3 ).
+        lv_off  = lv_close + 3.
+      ELSEIF lv_len - lv_off >= 2 AND substring( val = iv_text off = lv_off len = 2 ) = `,,`.
+        rv_text = rv_text && cl_abap_char_utilities=>horizontal_tab.
+        lv_off  = lv_off + 2.
+      ELSE.
+        rv_text = rv_text && substring( val = iv_text off = lv_off len = 1 ).
+        lv_off  = lv_off + 1.
+      ENDIF.
+    ENDWHILE.
   ENDMETHOD.
 
 
@@ -1478,19 +1530,27 @@ CLASS ZCL_CATS_MCP_HANDLER IMPLEMENTATION.
 
     LOOP AT lt_paragraphs INTO DATA(lv_paragraph).
       DATA(lv_rest)   = replace( val = lv_paragraph sub = |\r| with = `` occ = 0 ).
+      DATA(lt_units)  = escape_itf( lv_rest ).
       DATA(lv_format) = CONV bapicats8-format_col( '*' ).
+      DATA(lv_first)  = 1.
       DO.
-        DATA(lv_len) = nmin( val1 = strlen( lv_rest ) val2 = 132 ).
-        WHILE lv_len > 1 AND lv_len < strlen( lv_rest ) AND substring( val = lv_rest off = lv_len - 1 len = 1 ) = ` `.
-          lv_len = lv_len - 1.
+        DATA(lv_last) = lv_first - 1.
+        DATA(lv_len)  = 0.
+        WHILE lv_last < lines( lt_units ) AND lv_len + strlen( lt_units[ lv_last + 1 ] ) <= 132.
+          lv_last = lv_last + 1.
+          lv_len  = lv_len + strlen( lt_units[ lv_last ] ).
+        ENDWHILE.
+        WHILE lv_last > lv_first AND lv_last < lines( lt_units ) AND lt_units[ lv_last ] = ` `.
+          lv_last = lv_last - 1.
         ENDWHILE.
         APPEND VALUE bapicats8( row        = iv_row
                                 format_col = lv_format
-                                text_line  = substring( val = lv_rest len = lv_len ) )
+                                text_line  = concat_lines_of( VALUE string_table( FOR lv_idx = lv_first WHILE lv_idx <= lv_last
+                                                                                  ( lt_units[ lv_idx ] ) ) ) )
                TO rt_lines.
-        lv_rest   = substring( val = lv_rest off = lv_len ).
+        lv_first  = lv_last + 1.
         lv_format = '='.
-        IF lv_rest IS INITIAL.
+        IF lv_first > lines( lt_units ).
           EXIT.
         ENDIF.
       ENDDO.

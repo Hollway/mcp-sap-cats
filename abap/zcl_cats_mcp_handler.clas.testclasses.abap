@@ -37,6 +37,10 @@ CLASS ltc_handler DEFINITION FINAL
     METHODS to_bapi_te_catsdb_fields FOR TESTING.
     METHODS limit_change_over_norm_day FOR TESTING.
     METHODS limit_insert_counts_existing FOR TESTING.
+    METHODS split_longtext_escapes_itf FOR TESTING.
+    METHODS split_longtext_keeps_escape FOR TESTING.
+    METHODS longtext_unescapes_itf FOR TESTING.
+    METHODS longtext_round_trip_itf FOR TESTING.
 ENDCLASS.
 
 CLASS ltc_handler IMPLEMENTATION.
@@ -222,6 +226,39 @@ CLASS ltc_handler IMPLEMENTATION.
 
     cl_abap_unit_assert=>assert_equals( act = lines( lt_lines ) exp = 2 ).
     cl_abap_unit_assert=>assert_equals( act = cut->longtext_to_string( lt_lines ) exp = lv_text ).
+  ENDMETHOD.
+
+  METHOD split_longtext_escapes_itf.
+    DATA(lt_lines) = cut->split_longtext(
+      iv_row  = 1
+      iv_text = |a<b&c,,d{ cl_abap_char_utilities=>horizontal_tab }e| ).
+
+    cl_abap_unit_assert=>assert_equals( act = lines( lt_lines ) exp = 1 ).
+    cl_abap_unit_assert=>assert_equals( act = lt_lines[ 1 ]-text_line exp = 'a<(><<)>b<(>&<)>c,<(>,<)>d,,e' ).
+  ENDMETHOD.
+
+  METHOD split_longtext_keeps_escape.
+    DATA(lt_lines) = cut->split_longtext( iv_row = 1 iv_text = |{ repeat( val = `a` occ = 130 ) }<| ).
+
+    cl_abap_unit_assert=>assert_equals( act = lines( lt_lines ) exp = 2 ).
+    cl_abap_unit_assert=>assert_equals( act = strlen( lt_lines[ 1 ]-text_line ) exp = 130 ).
+    cl_abap_unit_assert=>assert_equals( act = lt_lines[ 2 ] exp = VALUE bapicats8( row = 1 format_col = '=' text_line = '<(><<)>' ) ).
+  ENDMETHOD.
+
+  METHOD longtext_unescapes_itf.
+    cl_abap_unit_assert=>assert_equals(
+      act = cut->longtext_to_string( VALUE #( ( format_col = '*' text_line = 'x<(>&<)>y,,z<(>,<)>' )
+                                              ( format_col = '=' text_line = '<(><<)> < >' ) ) )
+      exp = |x&y{ cl_abap_char_utilities=>horizontal_tab }z,< < >| ).
+  ENDMETHOD.
+
+  METHOD longtext_round_trip_itf.
+    DATA(lv_tab)  = cl_abap_char_utilities=>horizontal_tab.
+    DATA(lv_text) = |a<b & c,,d,{ lv_tab },e{ cl_abap_char_utilities=>newline }{ repeat( val = `<&,` occ = 60 ) }|.
+
+    cl_abap_unit_assert=>assert_equals(
+      act = cut->longtext_to_string( cut->split_longtext( iv_row = 1 iv_text = lv_text ) )
+      exp = lv_text ).
   ENDMETHOD.
 
   METHOD change_tables_keep_current.
