@@ -489,7 +489,17 @@ ${WRITE_RULES}`),
 }
 
 if (cfg.transport === "http") {
-  startHttpServer(loadHttpConfig(), (authorization) => buildServer(new SapClient(cfg, authorization)));
+  const http = startHttpServer(loadHttpConfig(), (authorization) => buildServer(new SapClient(cfg, authorization)));
+  /**
+   * В контейнере Node — PID 1, и без обработчика SIGTERM от docker stop не действует до SIGKILL.
+   * Запросы в работе дописываются: пишущие коммитят в том же вызове, обрыв оставил бы результат неизвестным.
+   */
+  const shutdown = () => {
+    http.close(() => process.exit(0));
+    http.closeIdleConnections();
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
 } else {
   await buildServer(new SapClient(cfg)).connect(new StdioServerTransport());
 }

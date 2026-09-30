@@ -81,11 +81,11 @@ const rawSocket = (text) =>
     socket.on("error", reject);
   });
 
-const raw = (method, { headers = {}, body, server = mcp } = {}) =>
+const raw = (method, { headers = {}, body, server = mcp, path } = {}) =>
   new Promise((resolve, reject) => {
     const url = new URL(server.url);
     const req = request(
-      { hostname: url.hostname, port: url.port, path: url.pathname, method, headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers } },
+      { hostname: url.hostname, port: url.port, path: path ?? url.pathname, method, headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers } },
       (res) => {
         let text = "";
         res.on("data", (chunk) => (text += chunk));
@@ -216,6 +216,34 @@ test("http: чужой Host — 403, GET — 405, не JSON — 400, чужой 
 
 test("http: без TLS на внешнем интерфейсе сервер не стартует", async () => {
   await assert.rejects(startMcp(baseEnv(sap.address().port, { MCP_HOST: "0.0.0.0" })), /без TLS/);
+});
+
+test("http: /health — 200 без Authorization и при любом Host, POST на /health — чужой путь", async () => {
+  const health = await raw("GET", { path: "/health", headers: { Host: "127.0.0.1:1" } });
+  assert.equal(health.status, 200);
+  assert.deepEqual(JSON.parse(health.text), { status: "ok" });
+  assert.equal((await raw("HEAD", { path: "/health" })).status, 200);
+  assert.equal((await raw("POST", { path: "/health", body: "{}" })).status, 404);
+});
+
+test("http: MCP_TLS_BY_PROXY=1 пускает открытый HTTP не на loopback, опечатка во флаге — отказ", async () => {
+  // 127.0.0.2 — не из списка loopback-имён, но не требует правила брандмауэра, как 0.0.0.0.
+  const env = (extra) => baseEnv(sap.address().port, { MCP_HOST: "127.0.0.2", ...extra });
+  await assert.rejects(startMcp(env({})), /без TLS/);
+  await assert.rejects(startMcp(env({ MCP_TLS_BY_PROXY: "yes" })), /допустимо 1 или 0/);
+  const proxied = await startMcp(env({ MCP_TLS_BY_PROXY: "1" }));
+  try {
+    assert.match(proxied.log(), /http:\/\/127\.0\.0\.2:\d+\/mcp \(HTTPS — на обратном прокси\)/);
+    const tools = await raw("POST", {
+      server: proxied,
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      headers: { Authorization: basic("alice", "a-secret") },
+    });
+    assert.equal(tools.status, 200);
+    assert.match(tools.text, /cats_read/);
+  } finally {
+    proxied.child.kill();
+  }
 });
 
 test("stdio: без SAP_USER не стартует, в http-режиме логин из .env не нужен", async () => {

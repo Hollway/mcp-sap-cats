@@ -1,0 +1,27 @@
+# В образ попадает только то, что копирует Dockerfile, но контекст сборки
+# уходит демону целиком — учётные данные отсекаются здесь.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+.npmrc
+
+.git
+.gitignore
+.gitlab-ci.yml
+.claude
+.codegraph
+graphify-out
+CLAUDE.md
+
+node_modules
+dist
+abap
+docs
+test
+*.log

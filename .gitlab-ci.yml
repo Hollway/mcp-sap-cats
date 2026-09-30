@@ -1,0 +1,30 @@
+# Сборка образа для HTTP-режима во встроенный реестр GitLab.
+# Все значения — встроенные переменные GitLab, подставляются при запуске.
+# Тесты — на каждый push и merge request, образ — только на тег (v1.0.0 и т.п.).
+
+stages:
+  - test
+  - build
+
+test:
+  stage: test
+  image: node:22-alpine
+  script:
+    - npm ci
+    - npm test
+
+build-image:
+  stage: build
+  image: docker:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  variables:
+    IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
+    IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build --pull -t "$IMAGE_TAG" -t "$IMAGE_LATEST" .
+    - docker push "$IMAGE_TAG"
+    - docker push "$IMAGE_LATEST"
+  after_script:
+    - docker image rm "$IMAGE_TAG" "$IMAGE_LATEST" || true

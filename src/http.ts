@@ -17,10 +17,19 @@ export interface HttpConfig {
   path: string;
   allowedHosts: string[];
   tls?: { cert: Buffer; key: Buffer };
+  tlsByProxy: boolean;
   maxBodyBytes: number;
 }
 
 const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost"]);
+
+/** Флаг окружения: только 1 или 0 — опечатка вроде «yes» не должна молча выключать проверку TLS. */
+function envFlag(name: string): boolean {
+  const value = (process.env[name] ?? "").trim();
+  if (value === "" || value === "0") return false;
+  if (value === "1") return true;
+  throw new Error(`${name}=${value}: допустимо 1 или 0`);
+}
 
 export function loadHttpConfig(): HttpConfig {
   const host = process.env.MCP_HOST || "127.0.0.1";
@@ -28,10 +37,12 @@ export function loadHttpConfig(): HttpConfig {
   const key = process.env.MCP_TLS_KEY;
   if (Boolean(cert) !== Boolean(key)) throw new Error("MCP_TLS_CERT и MCP_TLS_KEY задаются вместе");
   const tls = cert && key ? { cert: readFileSync(cert), key: readFileSync(key) } : undefined;
-  if (!tls && !LOOPBACK.has(host)) {
+  const tlsByProxy = envFlag("MCP_TLS_BY_PROXY");
+  if (!tls && !tlsByProxy && !LOOPBACK.has(host)) {
     throw new Error(
       `MCP_HOST=${host} без TLS: в заголовке Authorization пароль SAP, по открытому HTTP он уйдёт в сеть как есть. ` +
-        "Задайте MCP_TLS_CERT и MCP_TLS_KEY или слушайте 127.0.0.1 за обратным прокси с HTTPS.",
+        "Задайте MCP_TLS_CERT и MCP_TLS_KEY, или слушайте 127.0.0.1 за обратным прокси с HTTPS, " +
+        "или — в контейнере за таким прокси, порт которого снаружи не опубликован, — MCP_TLS_BY_PROXY=1.",
     );
   }
   const allowedHosts = (process.env.MCP_ALLOWED_HOSTS ?? "")
@@ -44,6 +55,7 @@ export function loadHttpConfig(): HttpConfig {
     path: "/mcp",
     allowedHosts: allowedHosts.length ? allowedHosts : LOOPBACK.has(host) ? [...LOOPBACK] : [host.toLowerCase()],
     ...(tls ? { tls } : {}),
+    tlsByProxy,
     maxBodyBytes: envInt("MCP_MAX_BODY_BYTES", 1_000_000, 1, 100_000_000),
   };
 }
@@ -131,6 +143,13 @@ export function startHttpServer(cfg: HttpConfig, build: (authorization: string) 
       jsonRpcError(res, status, message, headers);
     };
     const pathname = (req.url ?? "/").split("?")[0];
+    /** Проверка живости для HEALTHCHECK контейнера: он ходит на 127.0.0.1, поэтому без проверки Host; о SAP не говорит. */
+    if (pathname === "/health" && (req.method === "GET" || req.method === "HEAD")) {
+      req.resume();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(req.method === "HEAD" ? undefined : JSON.stringify({ status: "ok" }));
+      return;
+    }
     if (pathname !== cfg.path) return refuse(404, `Нет такого пути, MCP слушает ${cfg.path}`);
     if (!cfg.allowedHosts.includes(hostname(req.headers.host))) {
       return refuse(403, `Хост ${req.headers.host ?? "—"} не разрешён (MCP_ALLOWED_HOSTS)`);
@@ -194,7 +213,8 @@ export function startHttpServer(cfg: HttpConfig, build: (authorization: string) 
     const address = server.address();
     const port = typeof address === "object" && address ? address.port : cfg.port;
     const host = cfg.host.includes(":") ? `[${cfg.host}]` : cfg.host;
-    console.error(`sap-cats MCP слушает ${cfg.tls ? "https" : "http"}://${host}:${port}${cfg.path}`);
+    const note = !cfg.tls && cfg.tlsByProxy ? " (HTTPS — на обратном прокси)" : "";
+    console.error(`sap-cats MCP слушает ${cfg.tls ? "https" : "http"}://${host}:${port}${cfg.path}${note}`);
   });
   return server;
 }
